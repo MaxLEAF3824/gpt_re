@@ -1,3 +1,4 @@
 /gpt2_math/data/
-/__pycache__/.*
+/gpt2_math/__pycache__/*
+/__pycache__/*
 /gpt2_math/wandb/
