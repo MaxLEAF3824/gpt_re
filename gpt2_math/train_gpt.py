@@ -20,18 +20,23 @@ from collections import defaultdict
 
 @dataclass(frozen = True)
 class Config:
-    model_dir = "/mnt/petrelfs/guoyiqiu/coding/huggingface_models/gpt2-math/small"
-    bsz = 1024
+    home_dir = '/home/max'    
+    model_dir = f"{home_dir}/coding/huggingface_models/gpt2-math/small"
+    bsz = 4096
     data_dir = "data"
-    train_dataset_name = "train_100.txt"
-    test_dataset_name = "test_100.txt"
+    train_dataset_name = "train_2_zfill.txt"
+    test_dataset_name = "test_2_zfill.txt"
     lr: float = 1e-4 #@param
     weight_decay: float = 1.0 #@param
-    num_epochs: int = 2000 #@param
-    save_every: int = 200 #@param
+    num_epochs: int = 5000 #@param
+    save_every: int = 100 #@param
     save_models: bool = True #@param
     save_model_dir: str = os.path.join(model_dir,"saved_models") #@param
     device = t.device('cuda' if t.cuda.is_available() else 'cpu')
+    pth = None
+    # pth = "/home/max/coding/huggingface_models/gpt2-math/small/saved_models/grok_1678627879/4700.pth"
+    # device = t.device('cpu')
+    print(f"device:{device}")
     def is_it_time_to_save(self, epoch):
         return (epoch % self.save_every == 0)
 
@@ -41,7 +46,7 @@ class AdditionDataset(tud.Dataset):
         with open(data_path, 'r') as f:
             lines = f.readlines()
         lines = [line.strip() for line in lines]
-        self.inputs, self.prompts = self.make_inputs(self.tokenizer, lines)
+        self.data = self.make_inputs(self.tokenizer, lines)
 
     def make_inputs(self, tokenizer, prompts):
         token_lists = [tokenizer.encode(p) for p in prompts]
@@ -58,45 +63,16 @@ class AdditionDataset(tud.Dataset):
             labels.append([-100] * (maxlen - len(tok)) + [-100] * (eq_idx+1) + tok[eq_idx + 1:])
         input_ids = [[pad_id] * (maxlen - len(t)) + t for t in token_lists]
         attention_mask = [[0] * (maxlen - len(t)) + [1] * len(t) for t in token_lists]
-        return t.tensor([input_ids,attention_mask,labels]), t.tensor([prompt_ids,prompt_attention_mask])
+        return t.tensor([input_ids, attention_mask, labels, prompt_ids, prompt_attention_mask]).transpose(0,1)
 
 
     def __getitem__(self, index):
-        return self.inputs[index], self.prompts[index]
+        return self.data[index]
 
     def __len__(self):
-        return len(self.inputs)
+        return len(self.data)
 
-def eval_model(config: Config, model, tokenizer, data):
-    pad_id = tokenizer.all_special_ids[tokenizer.all_special_tokens.index("[PAD]")]
-    acc = []
-    wrong = []
-    for i in range(len(data)):
-        data_i = data[i]
-        inp = data_i[0]
-        prompt_inp = prompt_inp.to(config.device)
-        inp = inp.to(config.device)
-        input_ids = inp[0]
-        labels = inp[1]
-        max_new_tokens = t.where(labels!=-100, t.ones_like(labels), t.zeros_like(labels)).sum(1).max().item()
-        with t.no_grad():
-            output = model.generate(**prompt_inp, max_new_tokens=max_new_tokens)
-        pred = tokenizer.batch_decode(output[:,-max_new_tokens:])
-        gt = tokenizer.batch_decode(inp['input_ids'])
-        gt = [g.split("=")[1].strip() for g in gt]
-        for idx, (p, g) in enumerate(zip(pred, gt)):
-            flag = True
-            for i in range(len(g)):
-                if p[i] != g[i]:
-                    flag = False
-                    break
-            acc.append(flag)
-            if not flag:
-                wrong.append(tokenizer.decode(output[idx]))
-    return np.mean(acc), wrong
-
-
-def prepare_model_tokenizer(config):
+def gen_mt(config):
     model_dir = config.model_dir
     with open(os.path.join(model_dir,"model_config.json"), "r") as f:
         config_dict = json.load(f)
@@ -114,16 +90,6 @@ def gen_train_test(config: Config, tokenizer):
                       
     return train, test   
 
-def full_loss(config : Config, model, data):
-    '''Takes the cross entropy loss of the model on the data'''
-    loss = t.tensor(0.0,device=config.device)
-    bs = len(data)
-    for inp, prompt_inp in data:
-        inp = {k:v.to(config.device) for k,v in inp.items()}
-        res = model(**inp)
-        loss += res['loss']
-    return loss
-
 
 class Trainer:
     '''TODO
@@ -138,8 +104,10 @@ class Trainer:
 
     def __init__(self, config : Config) -> None:
         wandb.init(project = "grokking", mode='offline', config = dataclasses.asdict(config))
-        self.model, self.tokenizer = prepare_model_tokenizer(config)
+        self.model, self.tokenizer = gen_mt(config)
         self.model.to(config.device)
+        if getattr(config,"pth") is not None:
+            self.model.load_state_dict(t.load(config.pth)['model'])
         self.optimizer = optim.AdamW(self.model.parameters(), lr = config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.98))
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lambda step: min(step/10, 1)) # TODO make this a config option
         self.run_name = f"grok_{int(time.time())}"
@@ -153,8 +121,8 @@ class Trainer:
         self.config = config
 
     def save_epoch(self, epoch, save_to_wandb = True):
-        train_acc, _ = eval_model(config = self.config, model = self.model, tokenizer = self.tokenizer, data = self.train)
-        test_acc, _ = eval_model(config = self.config, model = self.model, tokenizer = self.tokenizer, data = self.test)
+        train_acc, wrong = self.eval_model(self.train)
+        test_acc, wrong = self.eval_model(self.test)
         self.train_acces.append(train_acc)
         self.test_acces.append(test_acc)
         ''' precondition! train loss and test losses have been appended to '''
@@ -175,15 +143,57 @@ class Trainer:
 
     def do_a_training_step(self, epoch: int):
         '''returns train_loss, test_loss'''
-        train_loss = full_loss(config = self.config, model = self.model, data = self.train)
-        test_loss = full_loss(config = self.config, model = self.model, data = self.test)
+        train_loss = self.full_loss(data = self.train)
+        test_loss = self.full_loss(data = self.test, backward=False)
         self.train_losses.append(train_loss.item())
         self.test_losses.append(test_loss.item())
-        train_loss.backward()
-        self.optimizer.step()
-        self.scheduler.step()
-        self.optimizer.zero_grad()
         return train_loss, test_loss
+    
+    def full_loss(self, data, backward=True):
+        '''Takes the cross entropy loss of the model on the data'''
+        full_loss = t.tensor(0.0, device=self.config.device)
+        bs = len(data)
+        self.model.requires_grad_(backward)
+        for d in data:
+            input_ids = d[:,0,:].to(self.config.device)
+            attention_mask = d[:,1,:].to(self.config.device)
+            labels = d[:,2,:].to(self.config.device)
+            res = self.model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
+            loss = res['loss']
+            if backward:
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            full_loss += loss / bs
+        return full_loss
+    
+    def eval_model(self, data):
+        pad_id = self.tokenizer.all_special_ids[self.tokenizer.all_special_tokens.index("[PAD]")]
+        acc = []
+        wrong = []
+        for d in data:
+            prompt_ids = d[:,3,:].to(self.config.device)
+            prompt_attn_mask = d[:,4,:].to(self.config.device)
+            input_ids = d[:,0,:].to(self.config.device)
+            labels = d[:,2,:].to(self.config.device)
+            max_new_tokens = t.where(labels!=-100, t.ones_like(labels), t.zeros_like(labels)).sum(1).max().item()
+            with t.no_grad():
+                output = self.model.generate(inputs=prompt_ids, attention_mask=prompt_attn_mask, max_new_tokens=max_new_tokens)
+            pred = self.tokenizer.batch_decode(output[:,-max_new_tokens:])
+            gt = self.tokenizer.batch_decode(input_ids)
+            gt = [g.split("=")[1].strip() for g in gt]
+            for idx, (p, g) in enumerate(zip(pred, gt)):
+                flag = True
+                for i in range(len(g)):
+                    if p[i] != g[i]:
+                        flag = False
+                        break
+                acc.append(flag)
+                if not flag:
+                    wrong.append(self.tokenizer.decode(output[idx]))
+        return np.mean(acc), wrong
+
 
     def initial_save_if_appropriate(self):
         if self.config.save_models:
