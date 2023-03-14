@@ -357,17 +357,18 @@ def plot_trace_result(result, save_dir=None, title=None, xlabel=None, modelname=
 
 
 if __name__ == "__main__":
-    model_dir = "/mnt/petrelfs/guoyiqiu/coding/huggingface_models"
+    model_dir = "/mnt/petrelfs/guoyiqiu/coding/huggingface_models/"
+    model_dir = ""
     data_dir = "/mnt/petrelfs/guoyiqiu/coding/data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_name = "gpt2-xl"
-    model = AutoModelForCausalLM.from_pretrained(f"{model_dir}/{model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(f"{model_dir}/{model_name}")
+    model_name = "gpt2"
+    model = AutoModelForCausalLM.from_pretrained(f"{model_dir}{model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(f"{model_dir}{model_name}")
     input_texts = KnownsDataset(data_dir, size=10)
 
     for i, input_text in tqdm(enumerate(input_texts)):
         print(i)
-        for comp_key, comp_kind in [("attn","key"),("attn","query"),("mlp","key"),("mlp","query")]:
+        for comp_key, comp_kind in [("attn","key"),("mlp","key")]:
             result = calculate_comp_flow(model, tokenizer, input_text, comp_key, comp_kind)
             plot_trace_result(result, title=f"{i}", save_dir="output")
     # input_text = "Context: Human die. Tom is human. Judugement: Tom would die. Is the judgement correct? The answer is yes"
