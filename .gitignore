@@ -1,5 +1,6 @@
 /gpt2_math/data/
 /gpt2_math/__pycache__/
-/__pycache__/
+*/__pycache__/*
 /gpt2_math/wandb/
 /output/
+/lightning_logs/
