@@ -120,7 +120,7 @@ def without_v(model, td):
     for i in range(model.config.n_layer):
         block = model.transformer.h[i]
         attn_weight = td[f'attn_{i}'].output[2].to(model.device)
-        attn_output,_ = attn_custom(block.attn, block.ln_1(x0), attn_weight=attn_weight)
+        attn_output, _ = attn_custom(block.attn, xv=block.ln_1(x0), attn_weight=attn_weight)
         mlp_output = td[f'mlp_{i}'].output.to(model.device)
         x_fixed += (attn_output + mlp_output)  # [bsz, seq, hidden]
     x_fixed = model.transformer.ln_f(x_fixed)

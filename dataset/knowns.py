@@ -54,17 +54,14 @@ class Knowns(Dataset):
         for d in data:
             prompt = d['prompt'].strip()
             prediction = d['prediction'].strip()
+            pred_ids = self.tokenizer.encode(prediction)
             
-            pred_first = prediction.split(' ')[0]
-            input_text = prompt + " " + pred_first
+            input_ids, attention_mask = self.tokenizer(prompt).values()
             
-            input_ids, attention_mask = self.tokenizer(input_text, padding=False, return_tensors='pt').values()
-            
-            input_ids.squeeze_()
-            attention_mask.squeeze_()
-            len_pre_pred = len(self.tokenizer.encode(pred_first))
+            input_ids = torch.tensor(input_ids + [pred_ids[0]])
+            attention_mask = torch.tensor(attention_mask + [1])
             labels = -100 * torch.ones_like(input_ids)
-            labels[-len_pre_pred:] = input_ids[-len_pre_pred:]
+            labels[-1] = input_ids[-1]
             
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
