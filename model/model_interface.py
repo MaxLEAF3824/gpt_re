@@ -10,6 +10,8 @@ from torch import ones_like, optim, Tensor, zeros_like
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import pytorch_lightning as pl
 from transformers.optimization import get_cosine_schedule_with_warmup
+import os
+
 
 def camelize(string: str):
     return ''.join([i.capitalize() for i in string.split('_')])
@@ -53,15 +55,15 @@ class LLMHook:
                  device="cpu"):
         self.module = module
         self.name = name if name is not None else module._get_name()
-        self.input = None
-        self.output = None
+        self.inputs = []
+        self.outputs = []
 
         def hook(module, input, output):
             if retain_input:
-                self.input = recursive_copy(input[0] if len(input) == 1 else input,
-                                            clone=clone, detach=detach, retain_grad=False, device=device)
+                self.inputs.append(recursive_copy(input[0] if len(input) == 1 else input,
+                                            clone=clone, detach=detach, retain_grad=False, device=device))
             if retain_output:
-                self.output = recursive_copy(output, clone=clone, detach=detach, device=device)
+                self.outputs.append(recursive_copy(output, clone=clone, detach=detach, device=device))
             if edit_output:
                 output = edit_output(module, input, output)
             return output
@@ -81,6 +83,11 @@ class LLM(pl.LightningModule):
     
     def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
+    
+    def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
+        input_ids, attention_mask = batch[0], batch[1]
+        labels = batch[2] if len(batch) > 2 else None
+        return self(input_ids, attention_mask=attention_mask, labels=labels)
     
     def set_predict_step(self, func):
         import types
@@ -204,9 +211,13 @@ class LLM(pl.LightningModule):
             self.tokenizer = mt.get_tokenizer()
         except:
             try:
-                self.model = AutoModelForCausalLM.from_pretrained(model_name)
+                # use cache dir as default to speed up
+                cache_dir = os.environ.get('HF_HOME', None)
+                cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
+                
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
                 # user fast tokenizer if possible
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=cache_dir)
                 if "llama" in model_name:
                     self.tokenizer.add_special_tokens(
                         {

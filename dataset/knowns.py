@@ -26,6 +26,9 @@ def pad_inputs(batch, pad_token_id=None):
         labels = torch.stack([F.pad(x, (max_len - len(x), 0), mode='constant', value=-100) for x in labels])
 
     return input_ids, attention_mask, labels
+    return {"input_ids":input_ids,
+            "attention_mask":attention_mask,
+            "labels":labels}
 
 class Knowns(Dataset):
     def __init__(self, data_dir: str, tokenizer : Tokenizer, size=None, *args, **kwargs,):

@@ -4,4 +4,5 @@
 /gpt2_math/wandb/
 /output/
 /lightning_logs/
+/data/*
 *.pyc
