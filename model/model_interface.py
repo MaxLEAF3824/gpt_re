@@ -1,6 +1,6 @@
 import contextlib
 import inspect
-from typing import List, Union
+from typing import Dict, List, Union
 import torch
 from torch import nn
 import importlib
@@ -15,6 +15,7 @@ import os
 
 def camelize(string: str):
     return ''.join([i.capitalize() for i in string.split('_')])
+
 
 def recursive_copy(x, clone=None, detach=None, retain_grad=None, device=None):
     """
@@ -41,9 +42,9 @@ def recursive_copy(x, clone=None, detach=None, retain_grad=None, device=None):
         return type(x)([recursive_copy(v, clone, detach, retain_grad, device) for v in x])
     else:
         assert False, f"Unknown type {type(x)} cannot be broken into tensors."
-        
 
-class LLMHook:
+
+class LLMHook(Dict):
     def __init__(self,
                  module,
                  name=None,
@@ -61,7 +62,7 @@ class LLMHook:
         def hook(module, input, output):
             if retain_input:
                 self.inputs.append(recursive_copy(input[0] if len(input) == 1 else input,
-                                            clone=clone, detach=detach, retain_grad=False, device=device))
+                                                  clone=clone, detach=detach, retain_grad=False, device=device))
             if retain_output:
                 self.outputs.append(recursive_copy(output, clone=clone, detach=detach, device=device))
             if edit_output:
@@ -69,9 +70,10 @@ class LLMHook:
             return output
 
         self.hook = module.register_forward_hook(hook)
-    
+
     def remove(self):
         self.hook.remove()
+
 
 class LLM(pl.LightningModule):
     def __init__(self, **kargs):
@@ -79,20 +81,20 @@ class LLM(pl.LightningModule):
         self.save_hyperparameters()
         self.load_mt()
         self.configure_loss()
-        self.hooks = []
-    
+        self.hooks = {}
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
-    
+
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
         input_ids, attention_mask = batch[0], batch[1]
         labels = batch[2] if len(batch) > 2 else None
         return self(input_ids, attention_mask=attention_mask, labels=labels)
-    
+
     def set_predict_step(self, func):
         import types
         self.predict_step = types.MethodType(func, self)
-    
+
     def predict_next_token(self, input_texts):
         '''batch: list of str'''
         input_ids, attention_mask = self.tokenizer(input_texts, padding=True, return_tensors='pt').values()
@@ -125,12 +127,11 @@ class LLM(pl.LightningModule):
         input_ids, attention_mask, labels = batch
 
         res = self(input_ids, attention_mask=attention_mask, labels=labels)
-        
+
         lm_logits = res['logits']
         # Shift so that tokens < n predict n
         shift_logits = lm_logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        
 
         if isinstance(res.get('loss'), Tensor):
             loss = res['loss']
@@ -164,8 +165,8 @@ class LLM(pl.LightningModule):
                 self.parameters(), lr=self.hparams.lr, weight_decay=weight_decay)
         else:
             optimizer = optim.AdamW(self.parameters(), lr=1e-4, weight_decay=0)
-        
-        # scheduler   
+
+        # scheduler
         try:
             lr_lambda = eval(self.hparams.lr_lambda)
         except:
@@ -178,9 +179,9 @@ class LLM(pl.LightningModule):
             warmup_t0 = self.hparams.warmup_t0
             scheduler = lrs.CosineAnnealingWarmRestarts(optimizer, T_0=warmup_t0)
             return [optimizer], [scheduler]
-        else:    
+        else:
             return optimizer
-            
+
     def generate(self, input_texts, **generate_kwargs):
         input_ids, attention_mask = self.tokenizer(input_texts, padding=True, return_tensors='pt').values()
         if 'max_new_tokens' not in generate_kwargs:
@@ -190,7 +191,7 @@ class LLM(pl.LightningModule):
         output_ids = self.model.generate(input_ids, attention_mask=attention_mask, **generate_kwargs)
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
-    
+
     def configure_loss(self):
         if not hasattr(self.hparams, "loss_func"):
             self.loss_func = F.cross_entropy
@@ -214,7 +215,7 @@ class LLM(pl.LightningModule):
                 # use cache dir as default to speed up
                 cache_dir = os.environ.get('HF_HOME', None)
                 cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
-                
+
                 self.model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
                 # user fast tokenizer if possible
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=cache_dir)
@@ -230,14 +231,17 @@ class LLM(pl.LightningModule):
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                 self.tokenizer.padding_side = 'left'
             except:
-                raise ValueError("illegal model name ")  
-    
+                raise ValueError("illegal model name ")
+
     def add_hook(self, module, name=None, retain_output=True, retain_input=False,
                  edit_output=None, clone=False, detach=False, device="cpu"):
-        self.hooks.append(LLMHook(module, name, retain_output, retain_input, 
-                                  edit_output, clone, detach, device))
-    
+        self.hooks[name] = LLMHook(module, name, retain_output, retain_input,
+                                   edit_output, clone, detach, device)
+
     def clear_hook(self):
-        for hook in self.hooks:
+        for name, hook in self.hooks.items():
             hook.remove()
-        self.hooks = []
+        self.hooks.clear()
+
+    def save_hook(self, path=""):
+        pass

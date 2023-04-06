@@ -1,17 +1,20 @@
+import os 
+import sys
+sys.path.append(os.path.join(os.getcwd(), '..'))
 import torch
 import torch.nn.functional as F
-from gpt_re.dataset.knowns import KnownsDataset
+from dataset.knowns import KnownsDataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from gpthook import TraceDict, get_hook_config
 from viz_tool import *
-import os
+
 import pickle
 from datasets import load_dataset
 import pdb
 from tqdm import tqdm
 from collections import defaultdict
-from gpt_re.dataset.utils import *
+from dataset.utils import *
 
 
 def make_inputs(tokenizer, prompts, max_len=1024, device="cuda"):

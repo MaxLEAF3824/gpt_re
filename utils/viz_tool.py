@@ -4,7 +4,8 @@ import torch
 import numpy as np
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
-
+import torch
+from treelib import Tree
 
 def plot_matrix(title:str, matrix, xlabel:str=None, ylabel:str=None, save: str = None):
     fig = plt.figure(figsize=(8, 6),dpi=100)
@@ -117,3 +118,29 @@ def plotly_bar(title:str, data, xlabel:str=None, ylabel:str=None, save: str = No
         fig.write_image(save)
     else:
         fig.show()
+
+
+def print_struct(data):
+    def build_tree(data, tree, parent=None):
+        for key, value in data.items() if isinstance(data, dict) else enumerate(data):
+            if isinstance(value, list):
+                node = tree.create_node(tag='list', parent=parent)
+                build_tree(value, tree, parent=node.identifier)
+            elif isinstance(value, tuple):
+                node = tree.create_node(tag='tuple', parent=parent)
+                build_tree(list(value), tree, parent=node.identifier)
+            elif isinstance(value, dict):
+                node = tree.create_node(tag='dict', parent=parent)
+                build_tree(value, tree, parent=node.identifier)
+            elif isinstance(value, torch.Tensor):
+                node = tree.create_node(tag=f'torch.Tensor({list(value.shape)})', parent=parent)
+            else:
+                node = tree.create_node(tag=f'{type(value).__name__}', parent=parent)
+            if isinstance(data, dict):
+                node.tag = f'"{key}": {node.tag}'
+        return tree
+
+    tree = Tree()
+    tree.create_node(tag='root', identifier=0)
+    build_tree(data, tree, parent=0)
+    tree.show()
