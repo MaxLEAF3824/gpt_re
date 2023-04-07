@@ -1,6 +1,7 @@
 import contextlib
 import inspect
 from typing import Dict, List, Union
+from arrow import get
 import torch
 from torch import nn
 import importlib
@@ -217,6 +218,9 @@ class LLM(pl.LightningModule):
                 cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
 
                 self.model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+                half = getattr(self.hparams, "half", False)
+                if half:
+                    self.model.half()
                 # user fast tokenizer if possible
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=cache_dir)
                 if "llama" in model_name:

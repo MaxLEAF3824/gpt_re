@@ -3,6 +3,7 @@
 */__pycache__/*
 /gpt2_math/wandb/
 /output/
-/lightning_logs/*
+*/lightning_logs/*
+*/.ipynb_checkpoints/*
 /data/*
 *.pyc
