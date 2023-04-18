@@ -12,35 +12,36 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import pytorch_lightning as pl
 from transformers.optimization import get_cosine_schedule_with_warmup
 import os
+import types
 
 
 def camelize(string: str):
     return ''.join([i.capitalize() for i in string.split('_')])
 
 
-def recursive_copy(x, clone=None, detach=None, retain_grad=None, device=None):
+def recursive_copy(x, float=False, clone=False, detach=False, retain_grad=False, device=None):
     """
     Copies a reference to a tensor, or an object that contains tensors,
     optionally detaching and cloning the tensor(s).  If retain_grad is
     true, the original tensors are marked to have grads retained.
     """
     if isinstance(x, torch.Tensor):
+        x = x.to(device)
         if retain_grad:
             if not x.requires_grad:
                 x.requires_grad = True
             x.retain_grad()
-        elif detach:
-            x = x.detach()
-        if clone:
-            x = x.clone()
-        if device:
-            x = x.to(device)
+        x = x.detach() if detach else x
+        x = x.clone() if clone else x
+        x = x.float() if float else x
         return x
     # Only dicts, lists, and tuples (and subclasses) can be copied.
     if isinstance(x, dict):
-        return type(x)({k: recursive_copy(v, clone, detach, retain_grad, device) for k, v in x.items()})
+        return type(x)({k: recursive_copy(v, float, clone, detach, retain_grad, device) for k, v in x.items()})
     elif isinstance(x, (list, tuple)):
-        return type(x)([recursive_copy(v, clone, detach, retain_grad, device) for v in x])
+        return type(x)([recursive_copy(v, float, clone, detach, retain_grad, device) for v in x])
+    elif x is None:
+        return None
     else:
         assert False, f"Unknown type {type(x)} cannot be broken into tensors."
 
@@ -52,20 +53,26 @@ class LLMHook(Dict):
                  retain_output=True,
                  retain_input=False,
                  edit_output=None,
+                 float=False,
                  clone=False,
                  detach=False,
+                 retain_grad=False,
                  device="cpu"):
         self.module = module
         self.name = name if name is not None else module._get_name()
         self.inputs = []
         self.outputs = []
+        # print(device)
 
         def hook(module, input, output):
             if retain_input:
-                self.inputs.append(recursive_copy(input[0] if len(input) == 1 else input,
-                                                  clone=clone, detach=detach, retain_grad=False, device=device))
+                self.inputs.append(recursive_copy(input, float=float, clone=clone,
+                                   detach=detach, retain_grad=retain_grad, device=device))
             if retain_output:
-                self.outputs.append(recursive_copy(output, clone=clone, detach=detach, device=device))
+                self.outputs.append(
+                    recursive_copy(
+                        output if 'mlp' in name.lower() else output[0], float=float, clone=clone, detach=detach,
+                        retain_grad=retain_grad, device=device))
             if edit_output:
                 output = edit_output(module, input, output)
             return output
@@ -93,12 +100,15 @@ class LLM(pl.LightningModule):
         return self(input_ids, attention_mask=attention_mask, labels=labels)
 
     def set_predict_step(self, func):
-        import types
         self.predict_step = types.MethodType(func, self)
+
+    def set_func(self, func_name, func):
+        setattr(self, func_name, types.MethodType(func, self))
 
     def predict_next_token(self, input_texts):
         '''batch: list of str'''
-        input_ids, attention_mask = self.tokenizer(input_texts, padding=True, return_tensors='pt').values()
+        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
+        input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
         res = self(input_ids, attention_mask=attention_mask)
         pred_idxs = torch.argmax(res['logits'][:, -1, :], dim=1).unsqueeze(1)
         next_token = self.tokenizer.batch_decode(pred_idxs)
@@ -184,7 +194,8 @@ class LLM(pl.LightningModule):
             return optimizer
 
     def generate(self, input_texts, **generate_kwargs):
-        input_ids, attention_mask = self.tokenizer(input_texts, padding=True, return_tensors='pt').values()
+        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
+        input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
         if 'max_new_tokens' not in generate_kwargs:
             generate_kwargs['max_new_tokens'] = 20
         input_ids = input_ids.to(self.device)
@@ -217,13 +228,13 @@ class LLM(pl.LightningModule):
                 cache_dir = os.environ.get('HF_HOME', None)
                 cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
 
-                self.model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+                self.model = AutoModelForCausalLM.from_pretrained(model_name)
                 half = getattr(self.hparams, "half", False)
                 if half:
                     self.model.half()
                 # user fast tokenizer if possible
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=cache_dir)
-                if "llama" in model_name:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                if "llama" in self.tokenizer.__class__.__name__.lower():
                     self.tokenizer.add_special_tokens(
                         {
                             "eos_token": "</s>",
@@ -237,15 +248,15 @@ class LLM(pl.LightningModule):
             except:
                 raise ValueError("illegal model name ")
 
-    def add_hook(self, module, name=None, retain_output=True, retain_input=False,
-                 edit_output=None, clone=False, detach=False, device="cpu"):
-        self.hooks[name] = LLMHook(module, name, retain_output, retain_input,
-                                   edit_output, clone, detach, device)
+    def add_hook(self, module, name=None, **kw_args):
+        self.hooks[name] = LLMHook(module, name, **kw_args)
 
     def clear_hook(self):
         for name, hook in self.hooks.items():
             hook.remove()
         self.hooks.clear()
 
-    def save_hook(self, path=""):
-        pass
+    def reset_hook(self):
+        for name, hook in self.hooks.items():
+            hook.outputs.clear()
+            hook.inputs.clear()

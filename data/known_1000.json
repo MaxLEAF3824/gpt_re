@@ -1129,7 +1129,7 @@
     "subject": "Zillow",
     "attribute": "Seattle",
     "template": "The headquarter of {} is in",
-    "prediction": " downtown Seattle, and the company's headquarters are in",
+    "prediction": " Seattle, and the company's headquarters are in",
     "prompt": "The headquarter of Zillow is in downtown",
     "relation_id": "P159"
   },

@@ -7,7 +7,7 @@ from dataset.knowns import KnownsDataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from gpthook import TraceDict, get_hook_config
-from viz_tool import *
+from my_utils import *
 
 import pickle
 from datasets import load_dataset
