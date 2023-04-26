@@ -13,7 +13,7 @@ import pytorch_lightning as pl
 from transformers.optimization import get_cosine_schedule_with_warmup
 import os
 import types
-
+import copy
 
 def camelize(string: str):
     return ''.join([i.capitalize() for i in string.split('_')])
@@ -99,9 +99,6 @@ class LLM(pl.LightningModule):
         labels = batch[2] if len(batch) > 2 else None
         return self(input_ids, attention_mask=attention_mask, labels=labels)
 
-    def set_predict_step(self, func):
-        self.predict_step = types.MethodType(func, self)
-
     def set_func(self, func_name, func):
         setattr(self, func_name, types.MethodType(func, self))
 
@@ -117,26 +114,32 @@ class LLM(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **padding already** '''
         input_ids, attention_mask, labels = batch
-
+        
         res = self(input_ids, attention_mask=attention_mask, labels=labels)
-
+        
+        lm_logits = res['logits']
+        # Shift so that tokens < n predict n
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
         if isinstance(res.get('loss'), Tensor):
             loss = res['loss']
         else:
-            lm_logits = res['logits']
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
             loss = self.loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        self.log('loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
+        total_num = torch.argwhere(shift_labels != -100).shape[0]
+        correct_num = torch.sum(pred == shift_labels).cpu().item()
+        
+        self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log('train_acc', correct_num/total_num, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **not padding**'''
         input_ids, attention_mask, labels = batch
-
+        
         res = self(input_ids, attention_mask=attention_mask, labels=labels)
 
         lm_logits = res['logits']
@@ -150,12 +153,11 @@ class LLM(pl.LightningModule):
             loss = self.loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-
         total_num = torch.argwhere(shift_labels != -100).shape[0]
         correct_num = torch.sum(pred == shift_labels).cpu().item()
 
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_acc', correct_num/total_num, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_loss', loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log('val_acc', correct_num/total_num, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
 
         return (correct_num, total_num)
 
@@ -164,18 +166,15 @@ class LLM(pl.LightningModule):
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
-        if hasattr(self.hparams, 'weight_decay'):
-            weight_decay = self.hparams.weight_decay
-        else:
-            weight_decay = 0
-
         # optimizer
-        camel_opt_name = camelize(self.hparams.optimizer)
+        camel_opt_name = camelize(self.hparams.optimizer) if hasattr(self.hparams, "optimizer") else 'AdamW'
+        weight_decay = self.hparams.weight_decay if hasattr(self.hparams, 'weight_decay') else 1
+        lr = self.hparams.lr if hasattr(self.hparams, "lr") else 1e-4
         if hasattr(optim, camel_opt_name):
             optimizer = getattr(optim, camel_opt_name)(
-                self.parameters(), lr=self.hparams.lr, weight_decay=weight_decay)
+                self.parameters(), lr=lr, weight_decay=weight_decay)
         else:
-            optimizer = optim.AdamW(self.parameters(), lr=1e-4, weight_decay=0)
+            optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
 
         # scheduler
         try:
@@ -187,7 +186,7 @@ class LLM(pl.LightningModule):
             scheduler = lrs.LambdaLR(optimizer, lr_lambda=lr_lambda)
             return [optimizer], [scheduler]
         elif lr_lambda == "cosine":
-            warmup_t0 = self.hparams.warmup_t0
+            warmup_t0 = self.hparams.warmup_t0 if hasattr(self.hparams, 'warmup_t0') else 10
             scheduler = lrs.CosineAnnealingWarmRestarts(optimizer, T_0=warmup_t0)
             return [optimizer], [scheduler]
         else:
@@ -198,8 +197,8 @@ class LLM(pl.LightningModule):
         input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
         if 'max_new_tokens' not in generate_kwargs:
             generate_kwargs['max_new_tokens'] = 20
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
+        input_ids = input_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
         output_ids = self.model.generate(input_ids, attention_mask=attention_mask, **generate_kwargs)
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
@@ -227,26 +226,19 @@ class LLM(pl.LightningModule):
                 # use cache dir as default to speed up
                 cache_dir = os.environ.get('HF_HOME', None)
                 cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
-
                 self.model = AutoModelForCausalLM.from_pretrained(model_name)
-                half = getattr(self.hparams, "half", False)
-                if half:
-                    self.model.half()
                 # user fast tokenizer if possible
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-                if "llama" in self.tokenizer.__class__.__name__.lower():
-                    self.tokenizer.add_special_tokens(
-                        {
-                            "eos_token": "</s>",
-                            "bos_token": "</s>",
-                            "unk_token": "</s>",
-                        }
-                    )
-                if self.tokenizer.pad_token_id is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.tokenizer.padding_side = 'left'
             except:
                 raise ValueError("illegal model name ")
+        if "llama" in self.tokenizer.__class__.__name__.lower():
+            self.tokenizer.add_special_tokens({
+                "eos_token": "</s>",
+                "bos_token": "</s>",
+                "unk_token": "</s>",
+            })
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = 'left'
 
     def add_hook(self, module, name=None, **kw_args):
         self.hooks[name] = LLMHook(module, name, **kw_args)

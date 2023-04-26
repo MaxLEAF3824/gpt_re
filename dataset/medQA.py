@@ -20,7 +20,7 @@ def pad_inputs(batch, pad_token_id=None):
 
     return input_ids, attention_mask, labels
 
-PROMPT_TEMPLATE = "You are a doctor, choose the right option based on the patient's description.\nQuestion: {question}\nOptions: {options}\nThe answer is option {answer_idx}"
+PROMPT_TEMPLATE = "You are a doctor, choose the right option based on the patient's description.\nOptions: {options}\nQuestion: {question}\nThe answer is option {answer_idx}"
 
 class MedQA(Dataset):
     def __init__(self, data_path: str, tokenizer: Tokenizer, size=None, *args, **kwargs,):
