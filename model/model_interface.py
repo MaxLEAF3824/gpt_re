@@ -172,9 +172,9 @@ class LLM(pl.LightningModule):
         lr = self.hparams.lr if hasattr(self.hparams, "lr") else 1e-4
         if hasattr(optim, camel_opt_name):
             optimizer = getattr(optim, camel_opt_name)(
-                self.parameters(), lr=lr, weight_decay=weight_decay)
+                self.trainer.model.parameters(), lr=lr, weight_decay=weight_decay)
         else:
-            optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = optim.AdamW(self.trainer.model.parameters(), lr=lr, weight_decay=weight_decay)
 
         # scheduler
         try:
@@ -199,7 +199,7 @@ class LLM(pl.LightningModule):
             generate_kwargs['max_new_tokens'] = 20
         input_ids = input_ids.to(self.model.device)
         attention_mask = attention_mask.to(self.model.device)
-        output_ids = self.model.generate(input_ids, attention_mask=attention_mask, **generate_kwargs)
+        output_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
 
