@@ -1,6 +1,3 @@
-# %% [markdown]
-# 初始化
-
 # %%
 import os
 import sys
@@ -36,7 +33,7 @@ global attn_name
 global mlp_name
 global trainer
 global device_idxs
-device_idxs = [1, 4]
+device_idxs = [0,2,3,4,6,]
 
 model_list = list({
     "gpt2": "/nvme/guoyiqiu/coding/huggingface/hub/models--gpt2/snapshots/e7da7f221d5bf496a48136c0cd264e630fe9fcc8",
@@ -48,14 +45,13 @@ model_list = list({
 }.items())
 
 llm_config = {
-    "optimizer": "adamw",
+    "optimizer": "AdamW",
     "lr": 1e-4,
 }
 
 hook_config = {
     "retain_output": True,
     "retain_input": False,
-    "retain_grad": False,
     "edit_output": None,
     "clone": True,
     "float": True,
@@ -111,7 +107,7 @@ def setup(btn):
     btn.description = "init modules..."
     init_modules()
     btn.description = "init hooks..."
-    init_hook(mt)
+    # init_hook(mt)
     btn.description = "Everything is ready."
     device_tbtn.value = 'cpu'
     precision_tbtn.value = 'float'
@@ -173,7 +169,7 @@ precision_tbtn.observe(switch_precision, names='value')
 
 mnt_slider = widgets.IntSlider(
     value=128,
-    min=10,
+    min=1,
     max=512,
     step=1,
     description='new token:',
@@ -219,15 +215,21 @@ submit_btn.on_click(generate)
 
 control_panel = widgets.HBox([mt_dropdown, setup_btn, precision_tbtn, device_tbtn])
 talk_panel = widgets.HBox([input_textarea, widgets.VBox([mnt_slider, submit_btn]), output_textarea])
-display(widgets.VBox([control_panel, talk_panel]))
+all_panel = widgets.VBox([control_panel, talk_panel])
+# display(all_panel)
 
 # %%
-mt_dropdown.index = 0
+mt_dropdown.index = 4
 setup_btn.click()
+precision_tbtn.value = 'half'
 
-# %% [markdown]
-# LORA Tune MedQA
+# %%
+bsz = 2
+num_workers = 4
 
+# train_dst = MedQA('/nvme/guoyiqiu/coding/datasets/MedQA/data_clean/questions/US/train.jsonl', tokenizer=mt.tokenizer)
+train_dst = Instruction('/nvme/guoyiqiu/coding/instruction_datasets/instruction_dataall.json', max_len=512, tokenizer=mt.tokenizer)
+train_dl = DataLoader(train_dst, batch_size=bsz, shuffle=True, collate_fn=train_dst.collate_fn, num_workers=num_workers)
 # %%
 from peft import get_peft_model, LoraConfig, TaskType
 
@@ -235,34 +237,34 @@ peft_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
     inference_mode=False,
     r=8,
-    lora_alpha=32,
-    lora_dropout=0.1,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    target_modules=['q_proj','v_proj'],
 )
 
 mt.model = get_peft_model(mt.model, peft_config)
 mt.model.print_trainable_parameters()
 
 # %%
-bsz = 2
+total_batch_size = 128
+num_devices = len(device_idxs)
+accumulation_steps = total_batch_size // (bsz * num_devices)
 
-train_dst = MedQA('/nvme/guoyiqiu/coding/datasets/MedQA/data_clean/questions/US/train.jsonl', tokenizer=mt.tokenizer, size=100)
-train_dl = DataLoader(train_dst, batch_size=bsz, shuffle=True, collate_fn=train_dst.collate_fn, num_workers=1)
-test_dst = MedQA('/nvme/guoyiqiu/coding/datasets/MedQA/data_clean/questions/US/test.jsonl', tokenizer=mt.tokenizer, size=50)
-test_dl = DataLoader(train_dst, batch_size=bsz, shuffle=False, collate_fn=test_dst.collate_fn, num_workers=1)
-
-
-# %%
 trainer_config = {
     "precision": "16-mixed",
     "accelerator": "auto",
-    "devices": [1,4],
-    "enable_checkpointing":True,
-    "max_epochs":1,
-    "strategy": "fsdp",
+    "devices": device_idxs,
+    # "enable_checkpointing":False,
+    'accumulate_grad_batches': accumulation_steps,
+    "max_epochs":5,
+    # "strategy": "fsdp",
 }
 
 mt.clear_hook()
-trainer = pl.Trainer(**trainer_config)
-trainer.fit(mt, train_dl, test_dl)
+# trainer = pl.Trainer(**trainer_config)
+# trainer = pl.Trainer(**trainer_config, logger=WandbLogger(project="tune medqa", name="full_5ep_vicuna7b"))
+trainer = pl.Trainer(**trainer_config, logger=WandbLogger(project="tune instruction_all", name="lora_10ep_vicuna7b"))
+trainer.fit(mt, train_dl)
+trainer.save_checkpoint('./output/lora_10ep_instruction_all_vicuna7b.ckpt')
 
 

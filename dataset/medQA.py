@@ -23,7 +23,8 @@ def pad_inputs(batch, pad_token_id=None):
 PROMPT_TEMPLATE = "You are a doctor, choose the right option based on the patient's description.\nOptions: {options}\nQuestion: {question}\nThe answer is option {answer_idx}"
 
 class MedQA(Dataset):
-    def __init__(self, data_path: str, tokenizer: Tokenizer, size=None, *args, **kwargs,):
+    def __init__(self, data_path: str, tokenizer: Tokenizer, size=None, max_len=1024, *args, **kwargs,):
+        self.max_len = max_len
         self.tokenizer = tokenizer
         self.data = list(jsonlines.open(data_path))
         self.data = self.data[:size] if size else self.data
@@ -43,6 +44,10 @@ class MedQA(Dataset):
             
             res = self.tokenizer(prompt, return_tensors='pt')
             input_ids, attention_mask = res.input_ids, res.attention_mask
+            
+            if input_ids.shape[-1] > self.max_len:
+                continue
+
             labels = -100 * torch.ones_like(input_ids)
             labels[:,-1] = input_ids[:,-1]
 

@@ -17,3 +17,4 @@ from .medQA import MedQA
 from .knowns import Knowns
 from .supervised_dataset import SupervisedDataset
 from .addition import Addition
+from .instruction import Instruction

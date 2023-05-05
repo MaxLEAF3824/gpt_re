@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import sys
 from typing import Dict, List, Union
 from arrow import get
 import torch
@@ -8,7 +9,7 @@ import importlib
 from torch.nn import functional as F
 import torch.optim.lr_scheduler as lrs
 from torch import ones_like, optim, Tensor, zeros_like
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, LlamaModel
 import pytorch_lightning as pl
 from transformers.optimization import get_cosine_schedule_with_warmup
 import os
@@ -19,27 +20,18 @@ def camelize(string: str):
     return ''.join([i.capitalize() for i in string.split('_')])
 
 
-def recursive_copy(x, float=False, clone=False, detach=False, retain_grad=False, device=None):
-    """
-    Copies a reference to a tensor, or an object that contains tensors,
-    optionally detaching and cloning the tensor(s).  If retain_grad is
-    true, the original tensors are marked to have grads retained.
-    """
+def recursive_copy(x, float=False, clone=False, detach=False, device=None):
     if isinstance(x, torch.Tensor):
         x = x.to(device)
-        if retain_grad:
-            if not x.requires_grad:
-                x.requires_grad = True
-            x.retain_grad()
         x = x.detach() if detach else x
         x = x.clone() if clone else x
         x = x.float() if float else x
         return x
     # Only dicts, lists, and tuples (and subclasses) can be copied.
     if isinstance(x, dict):
-        return type(x)({k: recursive_copy(v, float, clone, detach, retain_grad, device) for k, v in x.items()})
+        return type(x)({k: recursive_copy(v, float, clone, detach, device) for k, v in x.items()})
     elif isinstance(x, (list, tuple)):
-        return type(x)([recursive_copy(v, float, clone, detach, retain_grad, device) for v in x])
+        return type(x)([recursive_copy(v, float, clone, detach, device) for v in x])
     elif x is None:
         return None
     else:
@@ -56,23 +48,22 @@ class LLMHook(Dict):
                  float=False,
                  clone=False,
                  detach=False,
-                 retain_grad=False,
                  device="cpu"):
         self.module = module
         self.name = name if name is not None else module._get_name()
         self.inputs = []
         self.outputs = []
-        # print(device)
-
+        module.name = name
+        
         def hook(module, input, output):
             if retain_input:
-                self.inputs.append(recursive_copy(input, float=float, clone=clone,
-                                   detach=detach, retain_grad=retain_grad, device=device))
-            if retain_output:
-                self.outputs.append(
-                    recursive_copy(
-                        output if 'mlp' in name.lower() else output[0], float=float, clone=clone, detach=detach,
-                        retain_grad=retain_grad, device=device))
+                self.inputs.append(recursive_copy(input, float=float, clone=clone, detach=detach, device=device))
+            if isinstance(retain_output, bool):
+                if retain_output:
+                    self.outputs.append(recursive_copy(output if 'mlp' in name.lower() else output[0], float=float, clone=clone, detach=detach, device=device))
+            elif callable(retain_output):
+                if retain_output(module, input, output):
+                    self.outputs.append(recursive_copy(output if 'mlp' in name.lower() else output[0], float=float, clone=clone, detach=detach, device=device))
             if edit_output:
                 output = edit_output(module, input, output)
             return output
@@ -111,37 +102,46 @@ class LLM(pl.LightningModule):
         next_token = self.tokenizer.batch_decode(pred_idxs)
         return next_token
 
+    def _acc(self, shift_logits, label):
+        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
+        total_num = torch.argwhere(label != -100).shape[0]
+        correct_num = torch.sum(pred == label).item()
+        return correct_num / total_num
+    
     def training_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **padding already** '''
         input_ids, attention_mask, labels = batch
+        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
+        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
+        labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
         
-        res = self(input_ids, attention_mask=attention_mask, labels=labels)
+        res = self(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         
         lm_logits = res['logits']
-        # Shift so that tokens < n predict n
-        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_logits = lm_logits[..., :-1, :].contiguous() # Shift so that tokens < n predict n
         shift_labels = labels[..., 1:].contiguous()
         
-        if isinstance(res.get('loss'), Tensor):
+        if isinstance(res.get('loss'), torch.Tensor):
             loss = res['loss']
         else:
             loss = self.loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
-        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-        total_num = torch.argwhere(shift_labels != -100).shape[0]
-        correct_num = torch.sum(pred == shift_labels).cpu().item()
+        acc = self._acc(shift_logits, shift_labels)
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log('train_acc', correct_num/total_num, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
+        self.log('train_acc', acc, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
         
         return loss
 
     def validation_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **not padding**'''
         input_ids, attention_mask, labels = batch
+        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
+        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
+        labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
         
-        res = self(input_ids, attention_mask=attention_mask, labels=labels)
-
+        res = self(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        
         lm_logits = res['logits']
         # Shift so that tokens < n predict n
         shift_logits = lm_logits[..., :-1, :].contiguous()
@@ -154,10 +154,10 @@ class LLM(pl.LightningModule):
 
         pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
         total_num = torch.argwhere(shift_labels != -100).shape[0]
-        correct_num = torch.sum(pred == shift_labels).cpu().item()
-
+        correct_num = torch.sum(pred == shift_labels).item()
+        acc = self._acc(shift_logits, shift_labels)
         self.log('val_loss', loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log('val_acc', correct_num/total_num, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
+        self.log('val_acc', acc, on_step=False, sync_dist=True, on_epoch=True, prog_bar=True)
 
         return (correct_num, total_num)
 
@@ -167,14 +167,9 @@ class LLM(pl.LightningModule):
 
     def configure_optimizers(self):
         # optimizer
-        camel_opt_name = camelize(self.hparams.optimizer) if hasattr(self.hparams, "optimizer") else 'AdamW'
-        weight_decay = self.hparams.weight_decay if hasattr(self.hparams, 'weight_decay') else 1
         lr = self.hparams.lr if hasattr(self.hparams, "lr") else 1e-4
-        if hasattr(optim, camel_opt_name):
-            optimizer = getattr(optim, camel_opt_name)(
-                self.trainer.model.parameters(), lr=lr, weight_decay=weight_decay)
-        else:
-            optimizer = optim.AdamW(self.trainer.model.parameters(), lr=lr, weight_decay=weight_decay)
+        weight_decay = self.hparams.weight_decay if hasattr(self.hparams, 'weight_decay') else 1
+        optimizer = optim.AdamW(self.trainer.model.parameters(), lr=lr, weight_decay=weight_decay, fused=True)
 
         # scheduler
         try:
@@ -223,10 +218,10 @@ class LLM(pl.LightningModule):
             self.tokenizer = mt.get_tokenizer()
         except:
             try:
-                # use cache dir as default to speed up
-                cache_dir = os.environ.get('HF_HOME', None)
-                cache_dir = os.path.join(cache_dir, 'hub') if cache_dir else None
-                self.model = AutoModelForCausalLM.from_pretrained(model_name)
+                torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+                # if torch.__version__ >= "2" and sys.platform != "win32":
+                #     self.model = torch.compile(self.model)
                 # user fast tokenizer if possible
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
             except:
@@ -245,6 +240,8 @@ class LLM(pl.LightningModule):
 
     def clear_hook(self):
         for name, hook in self.hooks.items():
+            hook.outputs.clear()
+            hook.inputs.clear()
             hook.remove()
         self.hooks.clear()
 
