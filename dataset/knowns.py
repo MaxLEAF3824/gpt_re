@@ -22,17 +22,10 @@ def pad_inputs(batch, pad_token_id=None):
 
     return input_ids, attention_mask, labels
 class Knowns(Dataset):
-    def __init__(self, data_dir: str, tokenizer : Tokenizer, size=None, *args, **kwargs,):
+    def __init__(self, data_path: str, tokenizer : Tokenizer, size=None, *args, **kwargs,):
         self.tokenizer = tokenizer
-        data_dir = Path(data_dir)
-        known_loc = data_dir / "known_1000.json"
-        
-        if not known_loc.exists():
-            print(f"{known_loc} does not exist. Downloading from {REMOTE_URL}")
-            data_dir.mkdir(exist_ok=True, parents=True)
-            torch.hub.download_url_to_file(REMOTE_URL, known_loc)
 
-        with open(known_loc, "r") as f:
+        with open(data_path, "r") as f:
             self.data = json.load(f)
         if size:
             self.data = self.data[:min(size, len(self.data))]
@@ -51,12 +44,12 @@ class Knowns(Dataset):
             pred_ids = self.tokenizer.encode(prediction)
             
             res = self.tokenizer(prompt)
-            input_ids, attention_mask = res.ids, res.attention_mask
+            input_ids, attention_mask = res['input_ids'], res['attention_mask']
             
-            input_ids = torch.tensor(input_ids + [pred_ids[0]])
-            attention_mask = torch.tensor(attention_mask + [1])
+            input_ids = torch.tensor(input_ids + [pred_ids[0]]).unsqueeze(0)
+            attention_mask = torch.tensor(attention_mask + [1]).unsqueeze(0)
             labels = -100 * torch.ones_like(input_ids)
-            labels[-1] = input_ids[-1]
+            labels[:,-1] = input_ids[:,-1]
             
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
