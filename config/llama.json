@@ -1,0 +1,11 @@
+{   
+    "n_layer" : "config.num_hidden_layers",
+    "layer_module_tmp": "model.layers.{}",
+    "mlp_module_tmp": "model.layers.{}.mlp",
+    "attn_module_tmp": "model.layers.{}.self_attn",
+    "ln_1_module_tmp": "model.layers.{}.input_layernorm",
+    "ln_2_module_tmp": "model.layers.{}.post_self_attn_layernorm",
+    "ln_f_module": "model.norm",
+    "lm_head_module": "lm_head",
+    "embedding_module": "model.embed_tokens"
+}
