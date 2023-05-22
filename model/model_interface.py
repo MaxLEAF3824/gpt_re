@@ -1,8 +1,4 @@
-import contextlib
-import inspect
-import sys
 from typing import Dict, List, Union
-from arrow import get
 import torch
 from torch import nn
 import importlib
@@ -11,10 +7,10 @@ import torch.optim.lr_scheduler as lrs
 from torch import ones_like, optim, Tensor, zeros_like
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, LlamaModel
 import pytorch_lightning as pl
-from transformers.optimization import get_cosine_schedule_with_warmup
 import os
 import types
 import copy
+import json
 
 
 def camelize(string: str):
@@ -42,32 +38,36 @@ def recursive_copy(x, float=False, clone=False, detach=False, device=None):
 class LLMHook(Dict):
     def __init__(self,
                  module,
-                 name=None,
+                 name,
                  retain_output=True,
+                 output_save_func=None,
                  retain_input=False,
+                 input_save_func=None,
                  edit_output=None,
                  float=False,
                  clone=False,
                  detach=False,
                  device="cpu"):
         self.module = module
-        self.name = name if name is not None else module._get_name()
+        self.name = name
         self.inputs = []
         self.outputs = []
-        module.name = name
 
         def hook(module, input, output):
             if retain_input:
-                self.inputs.append(recursive_copy(
-                    input, float=float, clone=clone, detach=detach, device=device))
-            if isinstance(retain_output, bool):
-                if retain_output:
-                    self.outputs.append(recursive_copy(output if 'mlp' in name.lower(
-                    ) else output[0], float=float, clone=clone, detach=detach, device=device))
-            elif callable(retain_output):
-                if retain_output(module, input, output):
-                    self.outputs.append(recursive_copy(output if 'mlp' in name.lower(
-                    ) else output[0], float=float, clone=clone, detach=detach, device=device))
+                if input_save_func is not None:
+                    in_save = input_save_func(module, input, output)
+                else:
+                    in_save = recursive_copy(input[0] if isinstance(output, tuple) else input,
+                                             float=float, clone=clone, detach=detach, device=device)
+                self.inputs.append(in_save)
+            if retain_output:
+                if output_save_func is not None:
+                    out_save = output_save_func(module, input, output)
+                else:
+                    out_save = recursive_copy(output[0] if isinstance(output, tuple) else output,
+                                              float=float, clone=clone, detach=detach, device=device)
+                self.outputs.append(out_save)
             if edit_output:
                 output = edit_output(module, input, output)
             return output
@@ -83,6 +83,7 @@ class LLM(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.load_mt()
+        self.init_modules()
         self.configure_loss()
         self.hooks = {}
 
@@ -98,9 +99,9 @@ class LLM(pl.LightningModule):
         setattr(self, func_name, types.MethodType(func, self))
 
     def predict_next_token(self, input_texts):
-        '''batch: list of str'''
-        tok_res = self.tokenizer(
-            input_texts, padding=True, return_tensors='pt')
+        '''batch: str or list of str'''
+        input_texts = [input_texts] if isinstance(input_texts, str) else input_texts
+        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
         input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
         res = self(input_ids, attention_mask=attention_mask)
         pred_idxs = torch.argmax(res['logits'][:, -1, :], dim=1).unsqueeze(1)
@@ -236,32 +237,52 @@ class LLM(pl.LightningModule):
         model_name = self.hparams.model_name
         camel_name = camelize(model_name)
         try:
-            MT = getattr(importlib.import_module(
-                '.'+model_name, package=__package__), camel_name)
+            MT = getattr(importlib.import_module('.'+model_name, package=__package__), camel_name)
             mt = MT()
             self.model = mt.get_model()
             self.tokenizer = mt.get_tokenizer()
         except:
             try:
-                torch_dtype = torch.float16 if getattr(
-                    self.hparams, 'fp16', False) else torch.float32
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype=torch_dtype)
-                # if torch.__version__ >= "2" and sys.platform != "win32":
-                #     self.model = torch.compile(self.model)
-                # user fast tokenizer if possible
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    model_name, use_fast=True)
+                torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
             except:
                 raise ValueError("illegal model name ")
+
+        # add special tokens for llama model
         if "llama" in self.tokenizer.__class__.__name__.lower():
             self.tokenizer.add_special_tokens({
                 "eos_token": "</s>",
                 "bos_token": "</s>",
                 "unk_token": "</s>",
             })
+        # add pad token and set padding side to the left
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = 'left'
+
+    def init_modules(self):
+        model_class_name = self.model.__class__.__name__
+        cwd = os.path.abspath(os.path.dirname(__file__))
+        config_file_path = f'{cwd}/module_config/{model_class_name}.json'
+        if not os.path.exists(config_file_path):
+            raise ValueError(f"config file not found, you should add a {model_class_name}.json in model/module_config/")
+        config = json.load(open(config_file_path))
+        self.module_config = config
+        self.n_layer = eval(f"self.model.{config['n_layer']}")
+        self.ln_f = eval(f"self.model.{config['ln_f_module']}")
+        self.lm_head = eval(f"self.model.{config['lm_head_module']}")
+        self.embedding = eval(f"self.model.{config['embedding_module']}")
+        self.layers = []
+        self.mlps = []
+        self.attns = []
+        self.ln_1s = []
+        self.ln_2s = []
+        for l in range(self.n_layer):
+            self.layers.append(eval(f"self.model.{config['layer_module_tmp'].format(l)}"))
+            self.mlps.append(eval(f"self.model.{config['mlp_module_tmp'].format(l)}"))
+            self.attns.append(eval(f"self.model.{config['attn_module_tmp'].format(l)}"))
+            self.ln_1s.append(eval(f"self.model.{config['ln_1_module_tmp'].format(l)}"))
+            self.ln_2s.append(eval(f"self.model.{config['ln_2_module_tmp'].format(l)}"))
 
     def add_hook(self, module, name=None, **kw_args):
         self.hooks[name] = LLMHook(module, name, **kw_args)
