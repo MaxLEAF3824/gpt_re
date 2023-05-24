@@ -243,9 +243,11 @@ class LLM(pl.LightningModule):
             self.tokenizer = mt.get_tokenizer()
         except:
             try:
-                torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
-                self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+                # torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
+                self.model = AutoModelForCausalLM.from_pretrained(model_name)
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                if getattr(self.hparams, 'fp16', False):
+                    self.model = self.model.half()
             except:
                 raise ValueError("illegal model name ")
 
