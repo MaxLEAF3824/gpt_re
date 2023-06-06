@@ -255,8 +255,8 @@ class LLM(pl.LightningModule):
         if "llama" in self.tokenizer.__class__.__name__.lower():
             self.tokenizer.add_special_tokens({
                 "eos_token": "</s>",
-                "bos_token": "</s>",
-                "unk_token": "</s>",
+                "bos_token": "<s>",
+                "unk_token": "<unk>",
             })
         # add pad token and set padding side to the left
         self.tokenizer.pad_token = self.tokenizer.eos_token

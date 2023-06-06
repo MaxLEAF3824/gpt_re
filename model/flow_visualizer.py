@@ -3,45 +3,48 @@ import torch
 import os
 from copy import deepcopy
 from pyecharts import options as opts
-from pyecharts.charts import Bar, Timeline, Tab, Page
+from pyecharts.charts import Bar, Timeline, Tab, Page, Line
 from pyecharts.faker import Faker
 import ipywidgets as widgets
 from IPython.display import display
 import torch.nn as nn
+import torch.nn.functional as F
 
 SAVED_MODULES = ['layer', 'attn', 'mlp']
+LAYER = 0
+ATTN = 1
+MLP = 2
 
 class Unembedding(nn.Module):
     def __init__(self, lm_head, ln_f):
         super().__init__()
         self.lm_head = lm_head
-        self.lm_head.requires_grad_(False)
         self.ln_f = ln_f
-        self.ln_f.requires_grad_(False)
         
     def forward(self, x):
-        return self.lm_head(self.ln_f(x))
-        
+        with torch.no_grad():
+            x = self.ln_f(x)
+            x = self.lm_head(x)
+        return x
+
+class FlowData:
+    def __init__():
+        pass
+
+
 class FlowVisualizer:
-    def __init__(self, mt: LLM, max_unembed_num=1000):
-        self.mun = max_unembed_num
+    def __init__(self, mt: LLM):
         self.mt = mt
         self.idx2token = [f"{i}-{self.mt.tokenizer.decode(i)}" for i in range(self.mt.tokenizer.vocab_size)]
         self.unembedding = Unembedding(deepcopy(mt.lm_head).to('cpu').float(), deepcopy(mt.ln_f).to('cpu').float())
         self.init_save_hook()
-        self.sentences = []
-        self.next_tokens = []
-        self.inp_len = []
-        self.layer_matrixs = []  # [batch, n_layer, seq_len, hidden_size]
-        self.attn_matrixs = []
-        self.mlp_matrixs = []
-        self.layer_utokens = [] # unembedding tokens string for [batch, seq_len, max_unembed_num]
-        self.layer_uprobs = [] # [batch, seq_len, n_layer, max_unembed_num]
-        self.attn_utokens = []
-        self.attn_uprobs = []
-        self.mlp_utokens = []
-        self.mlp_uprobs = []
-        
+        self.sentences = [] # generated sentences
+        self.next_tokens = [] # next token of sentences
+        self.prompt_lengths = [] # prompt length of sentences
+        self.utokens = [] # 对于每个句子，都有seq_len个token，每个token都有一个vocab_size大小的utoken list [bsz, seq_len, vocab_size]
+        self.uprobs = [] # [bsz, 3, seq_len, n_layer, vocab_size]
+        self.infos = [] # 对于每个句子，每个模块每一层每个token的uprob信息熵 [bsz, 3, n_layer, seq_len]
+        self.diffs = [] # 对于每个句子，每个模块每一层每个token的uprob关于上一层的uprob的交叉熵 [bsz, 3, n_layer, seq_len]
         
     def init_save_hook(self):
         self.mt.clear_hook()
@@ -54,19 +57,23 @@ class FlowVisualizer:
             "detach": True,
             "device": "cpu"
         }
-        for l in range(self.mt.n_layer):
-            for h in SAVED_MODULES:
+        for h in SAVED_MODULES:
+            for l in range(self.mt.n_layer):
                 self.mt.add_hook(module=getattr(self.mt, h+'s')[l], name=f'{h}_{l}', **hook_config)
 
+    def get_sentence_matrix(self, sidx):
+        '''return matrix of sentence sidx with shape of [3, n_layer, seq_len, hidden_size]'''
+        return torch.stack([torch.cat([self.mt.hooks[f'{h}_{l}'].outputs[sidx] for l in range(self.mt.n_layer)], dim=0) for h in SAVED_MODULES])
+    
     def generate(self, input_texts, **gen_wargs):
         input_texts = input_texts if isinstance(input_texts, list) else [input_texts]
         inps = [self.mt.tokenizer(text, return_tensors='pt') for text in input_texts]
         
         for inp in inps:
             input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
-            self.inp_len.append(input_ids.shape[1])
+            self.prompt_lengths.append(input_ids.shape[1])
 
-            # generate
+            # model generate
             hook_idxs = [len(h.outputs) for h in self.mt.hooks.values()]
             with torch.no_grad():
                 input_ids = input_ids.to(self.mt.model.device)
@@ -74,85 +81,133 @@ class FlowVisualizer:
                 gen_wargs['max_new_tokens'] = 10 if 'max_new_tokens' not in gen_wargs else gen_wargs['max_new_tokens']
                 output_ids = self.mt.model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_wargs)
             
-            # merge hook outputs
+            # 模型会在generate的过程中多次forward产生多个hook中间值，需要把hook的输出拼接起来得到完整的句子的matrix
             for (hook, idx) in zip(self.mt.hooks.values(), hook_idxs):
                 hook.outputs[idx] = torch.cat([o for o in hook.outputs[idx:]], dim=1)
                 hook.outputs = hook.outputs[:idx+1]
             
-            # save matrix and utokens
-            for h in SAVED_MODULES:
-                matrixs = getattr(self, h+'_matrixs')
-                module_utokens = getattr(self, h+'_utokens')
-                module_uprobs = getattr(self, h+'_uprobs')
-                
-                # save matrix
-                cur_matrix = torch.cat([self.mt.hooks[f'{h}_{l}'].outputs[-1] for l in range(self.mt.n_layer)], dim=0)
-                matrixs.append(cur_matrix)
-
-                cur_uprob = torch.softmax(self.unembedding(cur_matrix), dim=-1)  # [n_layer, seq_len, vocab_size]
-                
-                # cutoff utokens (top k prob diff)
-                cur_udiff = (cur_uprob[1:] - cur_uprob[:-1]).abs().sum(dim=0) # [seq_len, vocab_size]
-                cur_uids = torch.topk(cur_udiff, k=self.mun, dim=-1, sorted=True).indices # [seq_len, max_unembed_num]
-                
-                seq_len = cur_uids.shape[0]
-                cur_utokens = []
-                cur_uprobs = []
-                for j in range(seq_len):
-                    uids = cur_uids[j]
-                    uprobs = torch.index_select(cur_uprob[:,j,:], dim=-1, index=uids) # [n_layer, max_unembed_num]
-                    utokens = [f"{self.idx2token[id]}" for id in uids] # [max_unembed_num]
-                    uprobs = uprobs.cpu().numpy().tolist()
-                    cur_utokens.append(utokens) # [seq_len, max_unembed_num]
-                    cur_uprobs.append(uprobs) # [seq_len, n_layer, max_unembed_num]
-                module_utokens.append(cur_utokens) # [batch, seq_len, max_unembed_num]
-                module_uprobs.append(cur_uprobs) # [batch, seq_len, n_layer, max_unembed_num]
+            # 保存generate的句子和下一个token
             out_tokens = self.mt.tokenizer.batch_decode(output_ids[0])
             self.sentences.append(out_tokens[:-1])
             self.next_tokens.append(out_tokens[-1])
-        self.mt.reset_hook()
+            
+            # 获取当前句子的关于每一层，每一个模块合并后的完整matrix [3, n_layer, seq_len, hidden_size]
+            cur_matrix = self.get_sentence_matrix(-1)
+            seq_len = cur_matrix.shape[2]
+            
+            # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
+            cur_prob = torch.softmax(self.unembedding(cur_matrix), dim=-1)  # [3, n_layer, seq_len, vocab_size]
 
-    def visual_utokens(self, sidx=-1, module='layer', unum=10):
-        assert module in SAVED_MODULES
+            # 计算信息熵和概率差
+            cur_info = -torch.sum(cur_prob * torch.log(cur_prob), dim=-1) # [3, n_layer, seq_len]
+            self.infos.append(cur_info)
+            cur_diff = (cur_prob[:,1:,:,:]-cur_prob[:,:-1,:,:]).abs().sum(-1) # [3, n_layer-1, seq_len]
+            cur_diff = torch.cat([torch.zeros((3,1,seq_len)), cur_diff], dim=1)
+            self.diffs.append(cur_diff)
+            
+            # 对generate的句子的每一个token对应的uprob，依据uprob在3个模块中的变化大小之和，对utoken从大到小排序
+            cur_utokens = [] # [seq_len, vocab_size]
+            cur_uprobs = [] # [seq_len, 3, n_layer, vocab_size]
+            for j in range(seq_len):
+                cur_token_prob = cur_prob[:,:,j,:] # [3, n_layer, vocab_size]
+                # 计算token在3个模块中的概率变化之和
+                cur_token_prob_diff = (cur_token_prob[1:] - cur_token_prob[:-1]).abs().sum(dim=0).sum(dim=0) # [vocab_size]
+                # 按照变化之和从大到小排序
+                cur_token_udiff, cur_token_uids = torch.sort(cur_token_prob_diff, descending=True)
+                cur_token_utokens = [self.idx2token[idx] for idx in cur_token_uids]
+                cur_utokens.append(cur_token_utokens)
+                cur_token_uprobs = cur_token_prob[:, :, cur_token_uids] # [3, n_layer, vocab_size]
+                cur_uprobs.append(cur_token_uprobs)
+            
+            # 保存utokens和uprobs
+            self.utokens.append(cur_utokens)
+            cur_uprobs = torch.stack(cur_uprobs).transpose(0, 1) # [3, seq_len, n_layer, vocab_size]
+            self.uprobs.append(cur_uprobs)
+                
+
+    def visualize_utokens(self, sidx=-1, unum=20):
         cur_sentence = self.sentences[sidx]
         tab = Tab()
         for tidx in range(len(cur_sentence)):
-            module_utokens = getattr(self, module+'_utokens')
-            module_uprobs = getattr(self, module+'_uprobs')
             tl = Timeline()
             for l in range(self.mt.n_layer):
-                cur_utokens = module_utokens[sidx][tidx][:unum]
-                cur_uprobs = module_uprobs[sidx][tidx][l][:unum]
+                cur_utokens = self.utokens[sidx][tidx][:unum]
+                cur_uprobs = self.uprobs[sidx][:,tidx,l,:unum] # [3, unum]
                 bar = (
                     Bar()
                     .add_xaxis(cur_utokens)
-                    .add_yaxis(module, cur_uprobs, label_opts=opts.LabelOpts(position="right"))
+                    .add_yaxis('layer', cur_uprobs[0].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
+                    .add_yaxis('attn', cur_uprobs[1].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
+                    .add_yaxis('mlp', cur_uprobs[2].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
                     .reversal_axis()
                     .set_global_opts(
-                        title_opts={"text": f"Unembedding Token Flow: {module}"},
+                        title_opts={"text": f"Unembedding Token Flow"},
                         xaxis_opts=opts.AxisOpts(name="Probability"),
-                        yaxis_opts=opts.AxisOpts(name="Top k Unembedding Tokens")
+                        yaxis_opts=opts.AxisOpts(name="Top k Unembedding Tokens"),
                     )
                 )
-                tl.add(bar, f"{l}")
+                tl.add(bar, f"{l+1}")
             tab.add(tl, cur_sentence[tidx])
+        return tab
+    
+    def visualize_info(self, sidx=-1):
+        cur_sentence = self.sentences[sidx]
+        tab = Tab()
+        for tidx in range(len(cur_sentence)):
+            cur_info = self.infos[sidx][:,:,tidx] # [3, n_layer]
+            cur_diff = self.diffs[sidx][:,:,tidx] # [3, n_layer]
+            xaxis = [str(l+1) for l in list(range(self.mt.n_layer))]
+            
+            c = (
+                Line()
+                .add_xaxis(xaxis)
+                .add_yaxis("layer info", cur_info[0].numpy().tolist(), yaxis_index=0)
+                .add_yaxis("attn info", cur_info[1].numpy().tolist(), yaxis_index=0)
+                .add_yaxis("mlp info", cur_info[2].numpy().tolist(), yaxis_index=0)
+                .add_yaxis("layer diff", cur_diff[0].numpy().tolist(), yaxis_index=1)
+                .add_yaxis("attn diff", cur_diff[1].numpy().tolist(), yaxis_index=1)
+                .add_yaxis("mlp diff", cur_diff[2].numpy().tolist(), yaxis_index=1)
+                .extend_axis(
+                    yaxis=opts.AxisOpts(
+                        name="Infomation Entropy",
+                        type_="value",
+                        min_=0,
+                        max_=cur_info.max().item(),
+                        position="right",
+                        axislabel_opts=opts.LabelOpts(formatter="{value}.4f"),
+                    )
+                )
+                .extend_axis(
+                    yaxis=opts.AxisOpts(
+                        name="Probability Change",
+                        type_="value",
+                        min_=0,
+                        max_=cur_diff.max().item(),
+                        position="left",
+                        axislabel_opts=opts.LabelOpts(formatter="{value}.4f"),
+                        splitline_opts=opts.SplitLineOpts(
+                            is_show=True, linestyle_opts=opts.LineStyleOpts(opacity=1)
+                        ),
+                    )
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="信息熵和"),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),
+                    )
+            )
+            tab.add(c, cur_sentence[tidx])
         return tab
     
     def get_similar_token(self, token_id, k=20):
         embedding = self.mt.embedding.weight.data
         cos_values, cos_indices = torch.topk(torch.cosine_similarity(embedding, embedding[token_id].unsqueeze(0), dim=1),k=k)
-        return [f"{i}.{self.idx2token[id]}: {cos_values[i].item():.3f}" for i, id in enumerate(cos_indices)]
+        return [f"{self.idx2token[id]}: {cos_values[i].item():.3f}" for i, id in enumerate(cos_indices)]
         
     def clear(self):
         self.sentences.clear()
         self.next_tokens.clear()
-        self.inp_len.clear()
-        self.layer_matrixs.clear()  
-        self.attn_matrixs.clear()
-        self.mlp_matrixs.clear()
-        self.layer_utokens.clear() 
-        self.layer_uprobs.clear() 
-        self.attn_utokens.clear()
-        self.attn_uprobs.clear()
-        self.mlp_utokens.clear()
-        self.mlp_uprobs.clear()
+        self.prompt_lengths.clear()
+        self.utokens.clear() 
+        self.uprobs.clear() 
+        self.infos.clear()
+        self.diffs.clear()
