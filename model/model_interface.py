@@ -11,82 +11,92 @@ import os
 import types
 import copy
 import json
-
-
-def camelize(string: str):
-    return ''.join([i.capitalize() for i in string.split('_')])
-
-
-def recursive_copy(x, float=False, clone=False, detach=False, device=None):
-    if isinstance(x, torch.Tensor):
-        x = x.to(device)
-        x = x.detach() if detach else x
-        x = x.clone() if clone else x
-        x = x.float() if float else x
-        return x
-    # Only dicts, lists, and tuples (and subclasses) can be copied.
-    if isinstance(x, dict):
-        return type(x)({k: recursive_copy(v, float, clone, detach, device) for k, v in x.items()})
-    elif isinstance(x, (list, tuple)):
-        return type(x)([recursive_copy(v, float, clone, detach, device) for v in x])
-    elif x is None:
-        return None
-    else:
-        assert False, f"Unknown type {type(x)} cannot be broken into tensors."
-
-
-class LLMHook(Dict):
-    def __init__(self,
-                 module,
-                 name,
-                 retain_output=True,
-                 output_save_func=None,
-                 retain_input=False,
-                 input_save_func=None,
-                 edit_output=None,
-                 float=False,
-                 clone=False,
-                 detach=False,
-                 device="cpu"):
-        self.module = module
-        self.name = name
-        self.inputs = []
-        self.outputs = []
-
-        def hook(module, input, output):
-            if retain_input:
-                if input_save_func is not None:
-                    in_save = input_save_func(module, input, output)
-                else:
-                    in_save = recursive_copy(input[0] if isinstance(output, tuple) else input,
-                                             float=float, clone=clone, detach=detach, device=device)
-                self.inputs.append(in_save)
-            if retain_output:
-                if output_save_func is not None:
-                    out_save = output_save_func(module, input, output)
-                else:
-                    out_save = recursive_copy(output[0] if isinstance(output, tuple) else output,
-                                              float=float, clone=clone, detach=detach, device=device)
-                self.outputs.append(out_save)
-            if edit_output:
-                output = edit_output(module, input, output)
-            return output
-
-        self.hook = module.register_forward_hook(hook)
-
-    def remove(self):
-        self.hook.remove()
-
-
+from .llm_hook import LLMHook
+    
 class LLM(pl.LightningModule):
-    def __init__(self, **kargs):
+    def __init__(self, **config):
         super().__init__()
         self.save_hyperparameters()
-        self.load_mt()
-        self.init_modules()
-        self.configure_loss()
-        self.hooks = {}
 
+    @classmethod
+    def from_pretrained(cls, **config):
+        self = cls(**config)
+        assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
+        self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, use_fast=True)
+        if getattr(self.hparams, 'fp16', False):
+            self.model.half()
+        self.post_init()
+        return self
+    
+    @classmethod
+    def from_mt(cls, model, tokenizer):
+        self = cls()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.post_init()
+        return self
+    
+    @classmethod
+    def from_local(cls, **config):
+        self = cls(**config)
+        assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from local"
+        model_name = self.hparams.model_name
+        camel_name = ''.join([i.capitalize() for i in model_name.split('_')])
+        mt = getattr(importlib.import_module('.'+model_name, package=__package__), camel_name)()
+        self.model = mt.model
+        self.tokenizer = mt.tokenizer
+        self.post_init()
+        return self
+    
+    def post_init(self):
+        self.tokenizer.add_special_tokens({
+            "eos_token": "</s>",
+            "bos_token": "<s>",
+            "unk_token": "<unk>",
+        })
+        # add pad token and set padding side to the left
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = 'left'
+        
+        # configure loss function
+        if not hasattr(self.hparams, "loss_func"):
+            self.loss_func = F.cross_entropy
+        else:
+            loss_func_name = self.hparams.loss_func.lower()
+            if hasattr(F, loss_func_name):
+                self.loss_func = getattr(F, loss_func_name)
+            else:
+                raise ValueError("illegal loss func")
+        
+        # configure module config
+        self.init_module_config(self.model)
+        
+    def init_module_config(self, model):
+        model_class_name = model.__class__.__name__
+        cwd = os.path.abspath(os.path.dirname(__file__))
+        config_file_path = f'{cwd}/module_config/{model_class_name}.json'
+        if not os.path.exists(config_file_path):
+            raise ValueError(f"module config file not found, you should add a {model_class_name}.json in model/module_config/")
+        config = json.load(open(config_file_path))
+        self.module_config = config
+        self.n_layer = eval(f"model.{config['n_layer']}")
+        self.ln_f = eval(f"model.{config['ln_f_module']}")
+        self.lm_head = eval(f"model.{config['lm_head_module']}")
+        self.embedding = eval(f"model.{config['embedding_module']}")
+        self.layers = []
+        self.attns = []
+        self.mlps = []
+        self.ln_1s = []
+        self.ln_2s = []
+        for l in range(self.n_layer):
+            self.layers.append(eval(f"model.{config['layer_module_tmp'].format(l)}"))
+            self.attns.append(eval(f"model.{config['attn_module_tmp'].format(l)}"))
+            self.mlps.append(eval(f"model.{config['mlp_module_tmp'].format(l)}"))
+            self.ln_1s.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
+            self.ln_2s.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
+        self.hooks = {}
+    
     def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
 
@@ -222,69 +232,6 @@ class LLM(pl.LightningModule):
             input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
-
-    def configure_loss(self):
-        if not hasattr(self.hparams, "loss_func"):
-            self.loss_func = F.cross_entropy
-            return
-        loss_func_name = self.hparams.loss_func.lower()
-        if hasattr(F, loss_func_name):
-            self.loss_func = getattr(F, loss_func_name)
-        else:
-            raise ValueError("illegal loss func")
-
-    def load_mt(self):
-        model_name = self.hparams.model_name
-        camel_name = camelize(model_name)
-        try:
-            MT = getattr(importlib.import_module('.'+model_name, package=__package__), camel_name)
-            mt = MT()
-            self.model = mt.get_model()
-            self.tokenizer = mt.get_tokenizer()
-        except:
-            try:
-                # torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
-                self.model = AutoModelForCausalLM.from_pretrained(model_name)
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-                if getattr(self.hparams, 'fp16', False):
-                    self.model = self.model.half()
-            except:
-                raise ValueError("illegal model name ")
-
-        # add special tokens for llama model
-        if "llama" in self.tokenizer.__class__.__name__.lower():
-            self.tokenizer.add_special_tokens({
-                "eos_token": "</s>",
-                "bos_token": "<s>",
-                "unk_token": "<unk>",
-            })
-        # add pad token and set padding side to the left
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = 'left'
-
-    def init_modules(self):
-        model_class_name = self.model.__class__.__name__
-        cwd = os.path.abspath(os.path.dirname(__file__))
-        config_file_path = f'{cwd}/module_config/{model_class_name}.json'
-        if not os.path.exists(config_file_path):
-            raise ValueError(f"config file not found, you should add a {model_class_name}.json in model/module_config/")
-        config = json.load(open(config_file_path))
-        self.module_config = config
-        self.n_layer = eval(f"self.model.{config['n_layer']}")
-        self.ln_f = eval(f"self.model.{config['ln_f_module']}")
-        self.lm_head = eval(f"self.model.{config['lm_head_module']}")
-        self.embedding = eval(f"self.model.{config['embedding_module']}")
-        self.layers = []
-        self.mlps = []
-        self.attns = []
-        self.ln_1s = []
-        self.ln_2s = []
-        for l in range(self.n_layer):
-            self.layers.append(eval(f"self.model.{config['layer_module_tmp'].format(l)}"))
-            self.mlps.append(eval(f"self.model.{config['mlp_module_tmp'].format(l)}"))
-            self.attns.append(eval(f"self.model.{config['attn_module_tmp'].format(l)}"))
-            self.ln_1s.append(eval(f"self.model.{config['ln_1_module_tmp'].format(l)}"))
-            self.ln_2s.append(eval(f"self.model.{config['ln_2_module_tmp'].format(l)}"))
 
     def add_hook(self, module, name=None, **kw_args):
         self.hooks[name] = LLMHook(module, name, **kw_args)

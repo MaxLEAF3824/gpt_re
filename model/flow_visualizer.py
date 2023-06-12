@@ -1,6 +1,5 @@
 from .model_interface import LLM
 import torch
-import os
 from copy import deepcopy
 from pyecharts import options as opts
 from pyecharts.charts import Bar, Timeline, Tab, Page, Line
@@ -9,11 +8,9 @@ import ipywidgets as widgets
 from IPython.display import display
 import torch.nn as nn
 import torch.nn.functional as F
-
+from tqdm import tqdm
 SAVED_MODULES = ['layer', 'attn', 'mlp']
-LAYER = 0
-ATTN = 1
-MLP = 2
+
 
 class Unembedding(nn.Module):
     def __init__(self, lm_head, ln_f):
@@ -26,11 +23,6 @@ class Unembedding(nn.Module):
             x = self.ln_f(x)
             x = self.lm_head(x)
         return x
-
-class FlowData:
-    def __init__():
-        pass
-
 
 class FlowVisualizer:
     def __init__(self, mt: LLM):
@@ -59,6 +51,7 @@ class FlowVisualizer:
         }
         for h in SAVED_MODULES:
             for l in range(self.mt.n_layer):
+                hook_config['retain_input'] = (l == 0 and h == 'layer') # 只保留Layer第一层的输入
                 self.mt.add_hook(module=getattr(self.mt, h+'s')[l], name=f'{h}_{l}', **hook_config)
 
     def get_sentence_matrix(self, sidx):
@@ -69,7 +62,7 @@ class FlowVisualizer:
         input_texts = input_texts if isinstance(input_texts, list) else [input_texts]
         inps = [self.mt.tokenizer(text, return_tensors='pt') for text in input_texts]
         
-        for inp in inps:
+        for inp in tqdm(inps, total=len(inps)):
             input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
             self.prompt_lengths.append(input_ids.shape[1])
 
@@ -85,6 +78,9 @@ class FlowVisualizer:
             for (hook, idx) in zip(self.mt.hooks.values(), hook_idxs):
                 hook.outputs[idx] = torch.cat([o for o in hook.outputs[idx:]], dim=1)
                 hook.outputs = hook.outputs[:idx+1]
+                if hook.retain_input:
+                    hook.inputs[idx] = torch.cat([o for o in hook.inputs[idx:]], dim=1)
+                    hook.inputs = hook.inputs[:idx+1]
             
             # 保存generate的句子和下一个token
             out_tokens = self.mt.tokenizer.batch_decode(output_ids[0])
@@ -96,13 +92,21 @@ class FlowVisualizer:
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
-            cur_prob = torch.softmax(self.unembedding(cur_matrix), dim=-1)  # [3, n_layer, seq_len, vocab_size]
+            cur_logits = self.unembedding(cur_matrix) # [3, n_layer, seq_len, vocab_size]
+            cur_prob = torch.softmax(cur_logits, dim=-1)  # [3, n_layer, seq_len, vocab_size]
 
-            # 计算信息熵和概率差
+            # 计算层信息熵
             cur_info = -torch.sum(cur_prob * torch.log(cur_prob), dim=-1) # [3, n_layer, seq_len]
             self.infos.append(cur_info)
-            cur_diff = (cur_prob[:,1:,:,:]-cur_prob[:,:-1,:,:]).abs().sum(-1) # [3, n_layer-1, seq_len]
-            cur_diff = torch.cat([torch.zeros((3,1,seq_len)), cur_diff], dim=1)
+
+            # 计算层概率差
+            # with torch.no_grad():
+            #     x0 = self.mt.embedding(output_ids[0,:-1]).unsqueeze(0).repeat(3, 1, 1).unsqueeze(1).cpu() # [3, 1, seq_len, hidden_size]
+            x0 = torch.stack([self.mt.hooks[f'layer_{0}'].inputs[-1] for h in SAVED_MODULES]) # [3, 1, seq_len, hidden_size]
+            logits0 = self.unembedding(x0) # [3, 1, seq_len, vocab_size]
+            cur_logits_extended = torch.cat([logits0, cur_logits], dim=1) # [3, n_layer+1, seq_len, vocab_size]
+            cur_diff = F.cross_entropy(cur_logits_extended[:,:-1].reshape(-1, cur_logits_extended.shape[-1]), cur_prob.reshape(-1, cur_prob.shape[-1]), reduction='none') # [3 * n_layer * seq_len]
+            cur_diff = cur_diff.reshape(3, self.mt.n_layer, seq_len) # [3, n_layer, seq_len]
             self.diffs.append(cur_diff)
             
             # 对generate的句子的每一个token对应的uprob，依据uprob在3个模块中的变化大小之和，对utoken从大到小排序
@@ -123,7 +127,6 @@ class FlowVisualizer:
             self.utokens.append(cur_utokens)
             cur_uprobs = torch.stack(cur_uprobs).transpose(0, 1) # [3, seq_len, n_layer, vocab_size]
             self.uprobs.append(cur_uprobs)
-                
 
     def visualize_utokens(self, sidx=-1, unum=20):
         cur_sentence = self.sentences[sidx]
@@ -136,71 +139,62 @@ class FlowVisualizer:
                 bar = (
                     Bar()
                     .add_xaxis(cur_utokens)
-                    .add_yaxis('layer', cur_uprobs[0].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
-                    .add_yaxis('attn', cur_uprobs[1].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
-                    .add_yaxis('mlp', cur_uprobs[2].numpy().tolist(), label_opts=opts.LabelOpts(position="right"))
+                    .add_yaxis('layer', cur_uprobs[0].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
+                    .add_yaxis('attn', cur_uprobs[1].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
+                    .add_yaxis('mlp', cur_uprobs[2].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
                     .reversal_axis()
                     .set_global_opts(
                         title_opts={"text": f"Unembedding Token Flow"},
                         xaxis_opts=opts.AxisOpts(name="Probability"),
-                        yaxis_opts=opts.AxisOpts(name="Top k Unembedding Tokens"),
+                        yaxis_opts=opts.AxisOpts(name="Top k UTokens"),
                     )
                 )
                 tl.add(bar, f"{l+1}")
             tab.add(tl, cur_sentence[tidx])
         return tab
     
-    def visualize_info(self, sidx=-1):
+    def visualize_info(self, sidx=-1, show_modules=['layer', 'attn', 'mlp'],show_diff=True):
         cur_sentence = self.sentences[sidx]
         tab = Tab()
         for tidx in range(len(cur_sentence)):
             cur_info = self.infos[sidx][:,:,tidx] # [3, n_layer]
             cur_diff = self.diffs[sidx][:,:,tidx] # [3, n_layer]
             xaxis = [str(l+1) for l in list(range(self.mt.n_layer))]
-            
             c = (
                 Line()
                 .add_xaxis(xaxis)
-                .add_yaxis("layer info", cur_info[0].numpy().tolist(), yaxis_index=0)
-                .add_yaxis("attn info", cur_info[1].numpy().tolist(), yaxis_index=0)
-                .add_yaxis("mlp info", cur_info[2].numpy().tolist(), yaxis_index=0)
-                .add_yaxis("layer diff", cur_diff[0].numpy().tolist(), yaxis_index=1)
-                .add_yaxis("attn diff", cur_diff[1].numpy().tolist(), yaxis_index=1)
-                .add_yaxis("mlp diff", cur_diff[2].numpy().tolist(), yaxis_index=1)
+                .extend_axis(
+                    yaxis=opts.AxisOpts(
+                        name="Cross Entropy",
+                        type_="value",
+                        position="right",
+                    )
+                )
                 .extend_axis(
                     yaxis=opts.AxisOpts(
                         name="Infomation Entropy",
                         type_="value",
-                        min_=0,
-                        max_=cur_info.max().item(),
-                        position="right",
-                        axislabel_opts=opts.LabelOpts(formatter="{value}"),
-                    )
-                )
-                .extend_axis(
-                    yaxis=opts.AxisOpts(
-                        name="Probability Change",
-                        type_="value",
-                        min_=0,
-                        max_=cur_diff.max().item(),
                         position="left",
-                        axislabel_opts=opts.LabelOpts(formatter="{value}"),
-                        splitline_opts=opts.SplitLineOpts(
-                            is_show=True, linestyle_opts=opts.LineStyleOpts(opacity=1)
-                        ),
                     )
                 )
+                .add_yaxis("layer info", cur_info[0].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False),)
+                .set_series_opts(yaxis_opts=opts.AxisOpts(is_show=False))
+                .add_yaxis("attn info", cur_info[1].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False))
+                .add_yaxis("mlp info", cur_info[2].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False))
+                .add_yaxis("layer diff", cur_diff[0].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
+                .add_yaxis("attn diff", cur_diff[1].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
+                .add_yaxis("mlp diff", cur_diff[2].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
                 .set_global_opts(
-                    title_opts=opts.TitleOpts(title="信息熵和"),
-                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),
-                    )
+                    title_opts=opts.TitleOpts(title="信息熵和交叉熵"),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),)
             )
             tab.add(c, cur_sentence[tidx])
         return tab
     
     def get_similar_token(self, token_id, k=20):
         embedding = self.mt.embedding.weight.data
-        cos_values, cos_indices = torch.topk(torch.cosine_similarity(embedding, embedding[token_id].unsqueeze(0), dim=1),k=k)
+        with torch.no_grad():
+            cos_values, cos_indices = torch.topk(torch.cosine_similarity(embedding, embedding[token_id].unsqueeze(0), dim=1),k=k)
         return [f"{self.idx2token[id]}: {cos_values[i].item():.3f}" for i, id in enumerate(cos_indices)]
         
     def clear(self):
