@@ -174,7 +174,7 @@ class FlowVisualizer:
                         min_=0,
                         max_=cur_info.max().item(),
                         position="right",
-                        axislabel_opts=opts.LabelOpts(formatter="{value}.4f"),
+                        axislabel_opts=opts.LabelOpts(formatter="{value}"),
                     )
                 )
                 .extend_axis(
@@ -184,7 +184,7 @@ class FlowVisualizer:
                         min_=0,
                         max_=cur_diff.max().item(),
                         position="left",
-                        axislabel_opts=opts.LabelOpts(formatter="{value}.4f"),
+                        axislabel_opts=opts.LabelOpts(formatter="{value}"),
                         splitline_opts=opts.SplitLineOpts(
                             is_show=True, linestyle_opts=opts.LineStyleOpts(opacity=1)
                         ),
