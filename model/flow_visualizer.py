@@ -56,7 +56,11 @@ class FlowVisualizer:
 
     def get_sentence_matrix(self, sidx):
         '''return matrix of sentence sidx with shape of [3, n_layer, seq_len, hidden_size]'''
-        return torch.stack([torch.cat([self.mt.hooks[f'{h}_{l}'].outputs[sidx] for l in range(self.mt.n_layer)], dim=0) for h in SAVED_MODULES])
+        cur_matrix = torch.stack([torch.cat([self.mt.hooks[f'{h}_{l}'].outputs[sidx] for l in range(self.mt.n_layer)], dim=0) for h in SAVED_MODULES])
+        return cur_matrix
+    
+    def get_x0(self, sidx):
+        return self.mt.hooks['layer_0'].inputs[sidx]# [1, seq_len, hidden_size]
     
     def generate(self, input_texts, **gen_wargs):
         input_texts = input_texts if isinstance(input_texts, list) else [input_texts]
@@ -92,6 +96,7 @@ class FlowVisualizer:
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
+            cur_matrix[1] = cur_matrix[0]+cur_matrix[1] #  attn+layer
             cur_logits = self.unembedding(cur_matrix) # [3, n_layer, seq_len, vocab_size]
             cur_prob = torch.softmax(cur_logits, dim=-1)  # [3, n_layer, seq_len, vocab_size]
 
@@ -100,10 +105,8 @@ class FlowVisualizer:
             self.infos.append(cur_info)
 
             # 计算层概率差
-            # with torch.no_grad():
-            #     x0 = self.mt.embedding(output_ids[0,:-1]).unsqueeze(0).repeat(3, 1, 1).unsqueeze(1).cpu() # [3, 1, seq_len, hidden_size]
-            x0 = torch.stack([self.mt.hooks[f'layer_{0}'].inputs[-1] for h in SAVED_MODULES]) # [3, 1, seq_len, hidden_size]
-            logits0 = self.unembedding(x0) # [3, 1, seq_len, vocab_size]
+            x0 = self.get_x0(-1) # [1, seq_len, hidden_size]
+            logits0 = self.unembedding(x0.unsqueeze(0).repeat(3,1,1,1)) # [3, 1, seq_len, vocab_size]
             cur_logits_extended = torch.cat([logits0, cur_logits], dim=1) # [3, n_layer+1, seq_len, vocab_size]
             cur_diff = F.cross_entropy(cur_logits_extended[:,:-1].reshape(-1, cur_logits_extended.shape[-1]), cur_prob.reshape(-1, cur_prob.shape[-1]), reduction='none') # [3 * n_layer * seq_len]
             cur_diff = cur_diff.reshape(3, self.mt.n_layer, seq_len) # [3, n_layer, seq_len]

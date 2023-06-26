@@ -50,13 +50,20 @@ class LLM(pl.LightningModule):
         return self
     
     def post_init(self):
-        self.tokenizer.add_special_tokens({
-            "eos_token": "</s>",
-            "bos_token": "<s>",
-            "unk_token": "<unk>",
-        })
-        # add pad token and set padding side to the left
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if not self.tokenizer.eos_token:
+            self.tokenizer.add_special_tokens({
+                "eos_token": "</s>",
+            })
+        if not self.tokenizer.bos_token:
+            self.tokenizer.add_special_tokens({
+                "bos_token": "<s>",
+            })
+        if not self.tokenizer.unk_token:
+            self.tokenizer.add_special_tokens({
+                "unk_token": "<unk>",
+            })
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = 'left'
         
         # configure loss function
@@ -127,14 +134,11 @@ class LLM(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **padding already** '''
         input_ids, attention_mask, labels = batch
-        input_ids = input_ids.unsqueeze(0) if len(
-            input_ids.shape) == 1 else input_ids
-        attention_mask = attention_mask.unsqueeze(0) if len(
-            attention_mask.shape) == 1 else attention_mask
+        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
+        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
         labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
 
-        res = self(input_ids=input_ids,
-                   attention_mask=attention_mask, labels=labels)
+        res = self(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
         lm_logits = res['logits']
         # Shift so that tokens < n predict n
@@ -159,14 +163,11 @@ class LLM(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **not padding**'''
         input_ids, attention_mask, labels = batch
-        input_ids = input_ids.unsqueeze(0) if len(
-            input_ids.shape) == 1 else input_ids
-        attention_mask = attention_mask.unsqueeze(0) if len(
-            attention_mask.shape) == 1 else attention_mask
+        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
+        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
         labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
 
-        res = self(input_ids=input_ids,
-                   attention_mask=attention_mask, labels=labels)
+        res = self(input_ids=input_ids,attention_mask=attention_mask, labels=labels)
 
         lm_logits = res['logits']
         # Shift so that tokens < n predict n
