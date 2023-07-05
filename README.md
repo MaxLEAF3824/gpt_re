@@ -11,6 +11,4 @@
 - 只关注预测概率变化最大的token子集
 	- e.g. 预测“苹果的颜色”时，可能与苹果、颜色相关的token的概率分布才有较大改变，而”汽车“一词的概率全程可能都变化不大，期望只观察那些变化巨大的token分布
 - 进一步：每个模块从input中获取了什么信息？mapping到了什么位置？
-	- Attention模块可以获取来自其他token的信息，而MLP模块不能
-	- 能够引起target token的neighbor token set的概率分布发生较大变化的模块是需要编辑的模块
 ![](https://s2.loli.net/2023/05/24/OaH3LkKNQAfRgZi.gif)
