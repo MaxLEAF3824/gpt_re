@@ -13,3 +13,4 @@
 	- Attention模块可以获取来自其他token的信息，而MLP模块不能
 	- 能够引起target token的neighbor token set的概率分布发生较大变化的模块是需要编辑的模块
 ![](https://s2.loli.net/2023/05/24/OaH3LkKNQAfRgZi.gif)
+![Pasted image 20230608104558](https://s2.loli.net/2023/06/08/3Gt4upDq1IMLBSN.png)
