@@ -1,4 +1,5 @@
 # GPT Reverse Engineering
+![Pasted image 20230602193801](https://s2.loli.net/2023/06/02/i6mdSPLDrzKxuo5.png)
 ## Motivation
 - 给一个prompt，GPT语言模型的推理过程，就是对**每个token**，**并行的**，**一层一层的**，**按顺序**算activation，last token的last layer activation接上LM_Head就是output logits了
 - 这个过程中，几乎每个activation都是有意义的，因为它们都通过attention机制隐式的为last token提供信息，但不同activation的作用是不同的。
