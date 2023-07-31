@@ -9,3 +9,5 @@
 /data/*
 *.pyc
 *.ckpt
+/experiments/analyse_residual_copy.ipynb
+/utils/trans_sk.json
