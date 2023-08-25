@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 SAVED_MODULES = ['layer', 'attn', 'mlp']
 
-
 class Unembedding(nn.Module):
     def __init__(self, lm_head, ln_f):
         super().__init__()
@@ -96,7 +95,7 @@ class FlowVisualizer:
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
-            cur_matrix[1] = cur_matrix[0]+cur_matrix[1] #  attn+layer
+            # cur_matrix[1] = cur_matrix[0]+cur_matrix[1] #  attn+layer
             cur_logits = self.unembedding(cur_matrix) # [3, n_layer, seq_len, vocab_size]
             cur_prob = torch.softmax(cur_logits, dim=-1)  # [3, n_layer, seq_len, vocab_size]
 

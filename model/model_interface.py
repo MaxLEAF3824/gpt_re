@@ -12,7 +12,37 @@ import types
 import copy
 import json
 from .llm_hook import LLMHook
-    
+
+class LoadWoInit:
+    """Context manager that disable parameter initialization."""
+
+    def __init__(self):
+        self.constant_ = torch.nn.init.constant_
+        self.zeros_ = torch.nn.init.zeros_
+        self.ones_ = torch.nn.init.ones_
+        self.uniform_ = torch.nn.init.uniform_
+        self.normal_ = torch.nn.init.normal_
+        self.kaiming_uniform_ = torch.nn.init.kaiming_uniform_
+        self.kaiming_normal_ = torch.nn.init.kaiming_normal_
+
+    def __enter__(self, *args, **kwargs):
+        torch.nn.init.constant_ = lambda *args, **kwargs: None
+        torch.nn.init.zeros_ = lambda *args, **kwargs: None
+        torch.nn.init.ones_ = lambda *args, **kwargs: None
+        torch.nn.init.uniform_ = lambda *args, **kwargs: None
+        torch.nn.init.normal_ = lambda *args, **kwargs: None
+        torch.nn.init.kaiming_uniform_ = lambda *args, **kwargs: None
+        torch.nn.init.kaiming_normal_ = lambda *args, **kwargs: None
+
+    def __exit__(self, *args, **kwargs):
+        torch.nn.init.constant_ = self.constant_
+        torch.nn.init.zeros_ = self.zeros_
+        torch.nn.init.ones_ = self.ones_
+        torch.nn.init.uniform_ = self.uniform_
+        torch.nn.init.normal_ = self.normal_
+        torch.nn.init.kaiming_uniform_ = self.kaiming_uniform_
+        torch.nn.init.kaiming_normal_ = self.kaiming_normal_    
+
 class LLM(pl.LightningModule):
     def __init__(self, **config):
         super().__init__()
@@ -22,7 +52,8 @@ class LLM(pl.LightningModule):
     def from_pretrained(cls, **config):
         self = cls(**config)
         assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
-        self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name)
+        with LoadWoInit():
+            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, use_fast=True)
         if getattr(self.hparams, 'fp16', False):
             self.model.half()
