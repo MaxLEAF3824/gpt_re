@@ -52,11 +52,10 @@ class LLM(pl.LightningModule):
     def from_pretrained(cls, **config):
         self = cls(**config)
         assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
+        torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name, torch_dtype=torch_dtype)
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, use_fast=True)
-        if getattr(self.hparams, 'fp16', False):
-            self.model.half()
         self.post_init()
         return self
     
