@@ -54,8 +54,8 @@ class LLM(pl.LightningModule):
         assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
         torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name, torch_dtype=torch_dtype)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, use_fast=True)
+            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name, trust_remote_code=True, torch_dtype=torch_dtype)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
     
@@ -251,16 +251,16 @@ class LLM(pl.LightningModule):
         else:
             return optimizer
 
-    def generate(self, input_texts, **generate_kwargs):
-        tok_res = self.tokenizer(
-            input_texts, padding=True, return_tensors='pt')
+    def generate(self, input_texts, cut_input=False, **generate_kwargs):
+        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
         input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
         if 'max_new_tokens' not in generate_kwargs:
             generate_kwargs['max_new_tokens'] = 20
         input_ids = input_ids.to(self.model.device)
         attention_mask = attention_mask.to(self.model.device)
-        output_ids = self.model.generate(
-            input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
+        output_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
+        if cut_input:
+            output_ids = output_ids[:, input_ids.shape[-1]:]
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
 

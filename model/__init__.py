@@ -14,3 +14,5 @@
 
 from .model_interface import LLM
 from .flow_visualizer import FlowVisualizer
+from .llm_hook import LLMHook
+from .llm_panel import LLMPanel

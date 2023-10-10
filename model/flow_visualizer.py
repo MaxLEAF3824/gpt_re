@@ -48,10 +48,14 @@ class FlowVisualizer:
             "detach": True,
             "device": "cpu"
         }
+        attn_weights_config = deepcopy(hook_config)
+        attn_weights_config['output_save_func'] = lambda m, i, o: o[1]
         for h in SAVED_MODULES:
             for l in range(self.mt.n_layer):
                 hook_config['retain_input'] = (l == 0 and h == 'layer') # 只保留Layer第一层的输入
                 self.mt.add_hook(module=getattr(self.mt, h+'s')[l], name=f'{h}_{l}', **hook_config)
+        for l in range(self.mt.n_layer):
+            self.mt.add_hook(module=getattr(self.mt, 'attns')[l], name=f'attn_weights_{l}', **attn_weights_config) 
 
     def get_sentence_matrix(self, sidx):
         '''return matrix of sentence sidx with shape of [3, n_layer, seq_len, hidden_size]'''
@@ -92,10 +96,10 @@ class FlowVisualizer:
             
             # 获取当前句子的关于每一层，每一个模块合并后的完整matrix [3, n_layer, seq_len, hidden_size]
             cur_matrix = self.get_sentence_matrix(-1)
+            print(cur_matrix.shape)
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
-            # cur_matrix[1] = cur_matrix[0]+cur_matrix[1] #  attn+layer
             cur_logits = self.unembedding(cur_matrix) # [3, n_layer, seq_len, vocab_size]
             cur_prob = torch.softmax(cur_logits, dim=-1)  # [3, n_layer, seq_len, vocab_size]
 
@@ -130,7 +134,7 @@ class FlowVisualizer:
             cur_uprobs = torch.stack(cur_uprobs).transpose(0, 1) # [3, seq_len, n_layer, vocab_size]
             self.uprobs.append(cur_uprobs)
 
-    def visualize_utokens(self, sidx=-1, unum=20):
+    def visualize_utokens(self, sidx=-1, show_modules=SAVED_MODULES, unum=20):
         cur_sentence = self.sentences[sidx]
         tab = Tab()
         for tidx in range(len(cur_sentence)):
@@ -138,59 +142,54 @@ class FlowVisualizer:
             for l in range(self.mt.n_layer):
                 cur_utokens = self.utokens[sidx][tidx][:unum]
                 cur_uprobs = self.uprobs[sidx][:,tidx,l,:unum] # [3, unum]
-                bar = (
-                    Bar()
-                    .add_xaxis(cur_utokens)
-                    .add_yaxis('layer', cur_uprobs[0].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
-                    .add_yaxis('attn', cur_uprobs[1].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
-                    .add_yaxis('mlp', cur_uprobs[2].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
-                    .reversal_axis()
-                    .set_global_opts(
+                bar = Bar()
+                bar = bar.add_xaxis(cur_utokens)
+                bar = bar.add_yaxis('layer', cur_uprobs[0].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False)) if "layer" in show_modules else bar
+                bar = bar.add_yaxis('attn', cur_uprobs[1].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False)) if "attn" in show_modules else bar
+                bar = bar.add_yaxis('mlp', cur_uprobs[2].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False)) if "mlp" in show_modules else bar
+                bar = bar.reversal_axis()
+                bar = bar.set_global_opts(
                         title_opts={"text": f"Unembedding Token Flow"},
                         xaxis_opts=opts.AxisOpts(name="Probability"),
                         yaxis_opts=opts.AxisOpts(name="Top k UTokens"),
                     )
-                )
                 tl.add(bar, f"{l+1}")
             tab.add(tl, cur_sentence[tidx])
         return tab
     
-    def visualize_info(self, sidx=-1, show_modules=['layer', 'attn', 'mlp'],show_diff=True):
+    def visualize_entropy(self, sidx=-1, show_modules=SAVED_MODULES,show_diff=True):
         cur_sentence = self.sentences[sidx]
         tab = Tab()
         for tidx in range(len(cur_sentence)):
             cur_info = self.infos[sidx][:,:,tidx] # [3, n_layer]
             cur_diff = self.diffs[sidx][:,:,tidx] # [3, n_layer]
             xaxis = [str(l+1) for l in list(range(self.mt.n_layer))]
-            c = (
-                Line()
-                .add_xaxis(xaxis)
-                .extend_axis(
+            line = Line()
+            line = line.add_xaxis(xaxis)
+            line = line.extend_axis(
                     yaxis=opts.AxisOpts(
                         name="Cross Entropy",
                         type_="value",
                         position="right",
                     )
                 )
-                .extend_axis(
+            line = line.extend_axis(
                     yaxis=opts.AxisOpts(
                         name="Infomation Entropy",
                         type_="value",
                         position="left",
                     )
                 )
-                .add_yaxis("layer info", cur_info[0].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False),)
-                .set_series_opts(yaxis_opts=opts.AxisOpts(is_show=False))
-                .add_yaxis("attn info", cur_info[1].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False))
-                .add_yaxis("mlp info", cur_info[2].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False))
-                .add_yaxis("layer diff", cur_diff[0].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
-                .add_yaxis("attn diff", cur_diff[1].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
-                .add_yaxis("mlp diff", cur_diff[2].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
-                .set_global_opts(
+            line = line.add_yaxis("layer entropy", cur_info[0].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False)) if "layer" in show_modules else line
+            line = line.add_yaxis("attn entropy", cur_info[1].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False)) if "attn" in show_modules else line
+            line = line.add_yaxis("mlp entropy", cur_info[2].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False)) if "mlp" in show_modules else line
+            line = line.add_yaxis("layer cross_entropy", cur_diff[0].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False)) if "layer" in show_modules and show_diff else line
+            line = line.add_yaxis("attn cross_entropy", cur_diff[1].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False)) if "attn" in show_modules and show_diff else line
+            line = line.add_yaxis("mlp cross_entropy", cur_diff[2].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False)) if "mlp" in show_modules and show_diff else line
+            line = line.set_global_opts(
                     title_opts=opts.TitleOpts(title="信息熵和交叉熵"),
-                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),)
-            )
-            tab.add(c, cur_sentence[tidx])
+                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"))
+            tab.add(line, cur_sentence[tidx])
         return tab
     
     def get_similar_token(self, token_id, k=20):
