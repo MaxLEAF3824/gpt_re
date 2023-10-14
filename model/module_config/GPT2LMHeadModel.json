@@ -1,6 +1,6 @@
 {
     "n_layer" : "config.num_hidden_layers",
-    "layer_module_tmp": "transformer.h[{}]",
+    "block_module_tmp": "transformer.h[{}]",
     "mlp_module_tmp": "transformer.h[{}].mlp",
     "attn_module_tmp": "transformer.h[{}].attn",
     "ln_1_module_tmp": "transformer.h[{}].ln_1",

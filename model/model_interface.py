@@ -1,47 +1,31 @@
 from typing import Dict, List, Union
 import torch
-from torch import nn
+from copy import deepcopy
+from pyecharts import options as opts
+from pyecharts.charts import Bar, Timeline, Tab, Page, Line
+import torch.nn as nn
+import torch.nn.functional as F
 import importlib
-from torch.nn import functional as F
 import torch.optim.lr_scheduler as lrs
 from torch import ones_like, optim, Tensor, zeros_like
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, LlamaModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import pytorch_lightning as pl
 import os
 import types
-import copy
 import json
-from .llm_hook import LLMHook
+from .llm_utils import *
 
-class LoadWoInit:
-    """Context manager that disable parameter initialization."""
-
-    def __init__(self):
-        self.constant_ = torch.nn.init.constant_
-        self.zeros_ = torch.nn.init.zeros_
-        self.ones_ = torch.nn.init.ones_
-        self.uniform_ = torch.nn.init.uniform_
-        self.normal_ = torch.nn.init.normal_
-        self.kaiming_uniform_ = torch.nn.init.kaiming_uniform_
-        self.kaiming_normal_ = torch.nn.init.kaiming_normal_
-
-    def __enter__(self, *args, **kwargs):
-        torch.nn.init.constant_ = lambda *args, **kwargs: None
-        torch.nn.init.zeros_ = lambda *args, **kwargs: None
-        torch.nn.init.ones_ = lambda *args, **kwargs: None
-        torch.nn.init.uniform_ = lambda *args, **kwargs: None
-        torch.nn.init.normal_ = lambda *args, **kwargs: None
-        torch.nn.init.kaiming_uniform_ = lambda *args, **kwargs: None
-        torch.nn.init.kaiming_normal_ = lambda *args, **kwargs: None
-
-    def __exit__(self, *args, **kwargs):
-        torch.nn.init.constant_ = self.constant_
-        torch.nn.init.zeros_ = self.zeros_
-        torch.nn.init.ones_ = self.ones_
-        torch.nn.init.uniform_ = self.uniform_
-        torch.nn.init.normal_ = self.normal_
-        torch.nn.init.kaiming_uniform_ = self.kaiming_uniform_
-        torch.nn.init.kaiming_normal_ = self.kaiming_normal_    
+class Unembedding(nn.Module):
+    def __init__(self, lm_head, ln_f):
+        super().__init__()
+        self.lm_head = lm_head
+        self.ln_f = ln_f
+        
+    def forward(self, x):
+        with torch.no_grad():
+            x = self.ln_f(x)
+            x = self.lm_head(x)
+        return x
 
 class LLM(pl.LightningModule):
     def __init__(self, **config):
@@ -54,7 +38,11 @@ class LLM(pl.LightningModule):
         assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
         torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_name, trust_remote_code=True, torch_dtype=torch_dtype)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.hparams.model_name, 
+                trust_remote_code=True,
+                torch_dtype=torch_dtype
+                )
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
@@ -117,22 +105,22 @@ class LLM(pl.LightningModule):
             raise ValueError(f"module config file not found, you should add a {model_class_name}.json in model/module_config/")
         config = json.load(open(config_file_path))
         self.module_config = config
+        self.idx2token = [f"{i}-{self.tokenizer.decode(i)}" for i in range(self.tokenizer.vocab_size)]
         self.n_layer = eval(f"model.{config['n_layer']}")
         self.ln_f = eval(f"model.{config['ln_f_module']}")
         self.lm_head = eval(f"model.{config['lm_head_module']}")
         self.embedding = eval(f"model.{config['embedding_module']}")
-        self.layers = []
-        self.attns = []
-        self.mlps = []
-        self.ln_1s = []
-        self.ln_2s = []
+        self.block = []
+        self.attn = []
+        self.mlp = []
+        self.ln_1 = []
+        self.ln_2 = []
         for l in range(self.n_layer):
-            self.layers.append(eval(f"model.{config['layer_module_tmp'].format(l)}"))
-            self.attns.append(eval(f"model.{config['attn_module_tmp'].format(l)}"))
-            self.mlps.append(eval(f"model.{config['mlp_module_tmp'].format(l)}"))
-            self.ln_1s.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
-            self.ln_2s.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
-        self.hooks = {}
+            self.block.append(eval(f"model.{config['block_module_tmp'].format(l)}"))
+            self.attn.append(eval(f"model.{config['attn_module_tmp'].format(l)}"))
+            self.mlp.append(eval(f"model.{config['mlp_module_tmp'].format(l)}"))
+            self.ln_1.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
+            self.ln_2.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
     
     def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
@@ -252,8 +240,8 @@ class LLM(pl.LightningModule):
             return optimizer
 
     def generate(self, input_texts, cut_input=False, **generate_kwargs):
-        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
-        input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
+        inp = self.tokenizer(input_texts, padding=True, return_tensors='pt')
+        input_ids, attention_mask = inp.input_ids, inp.attention_mask
         if 'max_new_tokens' not in generate_kwargs:
             generate_kwargs['max_new_tokens'] = 20
         input_ids = input_ids.to(self.model.device)
@@ -263,18 +251,110 @@ class LLM(pl.LightningModule):
             output_ids = output_ids[:, input_ids.shape[-1]:]
         answer = self.tokenizer.batch_decode(output_ids)
         return answer
+    
+    def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
+        unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
+        
+        inp = self.tokenizer(input_text, return_tensors='pt')
+        hook_configs = [LLMHookConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
+        num_modules = len(show_modules)
+        # hook_configs += [LLMHookConfig(module_name="attn_weights",layer=l, float=True, detach=True,output_save_func=lambda m,i,o: o[1]) for l in range(self.n_layer)]
+        with LLMHooker(self, hook_configs) as hooker:
+            gen_wargs['max_new_tokens'] = 1 if 'max_new_tokens' not in gen_wargs else gen_wargs['max_new_tokens']
+            output_ids = self.model.generate(input_ids=inp['input_ids'].to(self.model.device), attention_mask=inp['attention_mask'].to(self.model.device), **gen_wargs)
+            
+            # 模型会在generate的过程中多次forward产生多个hook中间值，需要把hook的输出拼接起来得到完整的句子的matrix
+            for hook in hooker.hooks:
+                hook.outputs = [torch.cat([o for o in hook.outputs], dim=1)]
+                if hook.config.retain_input:
+                    hook.inputs= [torch.cat([o for o in hook.inputs], dim=1)]
+            
+            # 保存generate的句子和下一个token
+            out_tokens = self.tokenizer.batch_decode(output_ids[0])
+            cur_sentence = out_tokens[:-1]
+            
+            # 获取当前句子的关于每一层，每一个模块合并后的完整matrix [num_modules, n_layer, seq_len, hidden_size]
+            cur_matrix = []
+            for m in show_modules:
+                module_hooks = sorted([h for h in hooker.hooks if h.config.module_name == m], key=lambda h: h.config.layer)
+                cur_matrix.append(torch.cat([h.outputs[0] for h in module_hooks], dim=0))
+            cur_matrix = torch.stack(cur_matrix)
+            seq_len = cur_matrix.shape[2]
+            
+            # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
+            cur_logits = unembedding(cur_matrix) # [num_modules, n_layer, seq_len, vocab_size]
+            cur_prob = torch.softmax(cur_logits, dim=-1)  # [num_modules, n_layer, seq_len, vocab_size]
 
-    def add_hook(self, module, name=None, **kw_args):
-        self.hooks[name] = LLMHook(module, name, **kw_args)
+            # 计算层信息熵
+            cur_info = -torch.sum(cur_prob * torch.log(cur_prob), dim=-1) # [num_modules, n_layer, seq_len]
 
-    def clear_hook(self):
-        for name, hook in self.hooks.items():
-            hook.outputs.clear()
-            hook.inputs.clear()
-            hook.remove()
-        self.hooks.clear()
-
-    def reset_hook(self):
-        for name, hook in self.hooks.items():
-            hook.outputs.clear()
-            hook.inputs.clear()
+            # 计算层概率差
+            block_hook0 = [h for h in hooker.hooks if h.config.module_name == 'block' and h.config.layer == 0][0]
+            x0 = block_hook0.inputs[0]# [1, seq_len, hidden_size]
+            logits0 = unembedding(x0.unsqueeze(0).repeat(num_modules,1,1,1)) # [num_modules, 1, seq_len, vocab_size]
+            cur_logits_extended = torch.cat([logits0, cur_logits], dim=1) # [num_modules, n_layer+1, seq_len, vocab_size]
+            cur_diff = F.cross_entropy(cur_logits_extended[:,:-1].reshape(-1, cur_logits_extended.shape[-1]), cur_prob.reshape(-1, cur_prob.shape[-1]), reduction='none') # [num_modules * n_layer * seq_len]
+            cur_diff = cur_diff.reshape(num_modules, self.n_layer, seq_len) # [num_modules, n_layer, seq_len]
+            
+            # 对generate的句子的每一个token对应的uprob，依据uprob在3个模块中的变化大小之和，对utoken从大到小排序
+            cur_utokens = [] # [seq_len, vocab_size]
+            cur_uprobs = [] # [seq_len, num_modules, n_layer, vocab_size]
+            for j in range(seq_len):
+                cur_token_prob = cur_prob[:,:,j,:] # [num_modules, n_layer, vocab_size]
+                # 计算token在num_modules个模块中的概率变化之和
+                cur_token_prob_diff = (cur_token_prob[1:] - cur_token_prob[:-1]).abs().sum(dim=0).sum(dim=0) # [vocab_size]
+                # 按照变化之和从大到小排序
+                cur_token_udiff, cur_token_uids = torch.sort(cur_token_prob_diff, descending=True)
+                cur_token_utokens = [self.idx2token[idx] for idx in cur_token_uids]
+                cur_utokens.append(cur_token_utokens)
+                cur_token_uprobs = cur_token_prob[:, :, cur_token_uids] # [num_modules, n_layer, vocab_size]
+                cur_uprobs.append(cur_token_uprobs)
+            
+            cur_uprobs = torch.stack(cur_uprobs).transpose(0, 1) # [num_modules, seq_len, n_layer, vocab_size]
+            
+        # visualize utokens
+        utokens_tab = Tab()
+        for tidx in range(len(cur_sentence)):
+            tl = Timeline()
+            for l in range(self.n_layer):
+                cur_utokens_ = cur_utokens[tidx][:utokens_num]
+                cur_uprobs_ = cur_uprobs[:,tidx,l,:utokens_num] # [num_modules, utokens_num]
+                bar = Bar()
+                bar = bar.add_xaxis(cur_utokens_)
+                for i,m in enumerate(show_modules):
+                    bar = bar.add_yaxis(m, cur_uprobs_[i].numpy().tolist(), label_opts=opts.LabelOpts(is_show=False))
+                bar = bar.reversal_axis()
+                bar = bar.set_global_opts(
+                        title_opts={"text": f"Unembedding Token Flow"},
+                        xaxis_opts=opts.AxisOpts(name="Probability"),
+                        yaxis_opts=opts.AxisOpts(name="Top k UTokens"),
+                    )
+                tl.add(bar, f"{l+1}")
+            utokens_tab.add(tl, cur_sentence[tidx])
+        
+        # visualize entropy
+        entropy_tab = Tab()
+        for tidx in range(len(cur_sentence)):
+            cur_info_ = cur_info[:,:,tidx] # [num_modules, n_layer]
+            cur_diff_ = cur_diff[:,:,tidx] # [num_modules, n_layer]
+            xaxis = [str(l+1) for l in list(range(self.n_layer))]
+            line = Line()
+            line = line.add_xaxis(xaxis)
+            line = line.extend_axis(yaxis=opts.AxisOpts(name="Cross Entropy", type_="value", position="right"))
+            line = line.extend_axis(yaxis=opts.AxisOpts(name="Infomation Entropy", type_="value", position="left"))
+            for i,m in enumerate(show_modules):
+                line = line.add_yaxis(f"{m} entropy", cur_info_[i].numpy().tolist(), yaxis_index=0, label_opts=opts.LabelOpts(is_show=False))
+                if show_diff:
+                    line = line.add_yaxis(f"{m} cross_entropy", cur_diff_[i].numpy().tolist(), yaxis_index=1, label_opts=opts.LabelOpts(is_show=False))
+            line = line.set_global_opts(
+                    title_opts=opts.TitleOpts(title="信息熵和交叉熵"),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"))
+            entropy_tab.add(line, cur_sentence[tidx])
+            
+        return utokens_tab, entropy_tab
+    
+    def get_similar_token(self, token_id, k=20):
+        embedding = self.embedding.weight.data
+        with torch.no_grad():
+            cos_values, cos_indices = torch.topk(torch.cosine_similarity(embedding, embedding[token_id].unsqueeze(0), dim=1),k=k)
+        return [f"{self.idx2token[id]}: {cos_values[i].item():.3f}" for i, id in enumerate(cos_indices)]

@@ -1,6 +1,6 @@
 {   
     "n_layer" : "config.num_hidden_layers",
-    "layer_module_tmp": "model.layers[{}]",
+    "block_module_tmp": "model.layers[{}]",
     "mlp_module_tmp": "model.layers[{}].mlp",
     "attn_module_tmp": "model.layers[{}].self_attn",
     "ln_1_module_tmp": "model.layers[{}].input_layernorm",

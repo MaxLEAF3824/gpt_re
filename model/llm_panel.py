@@ -2,8 +2,7 @@ import os
 import time
 import torch
 from .model_interface import *
-from utils.my_utils import *
-from utils.BaiduTrans import BaiduTrans
+from .llm_utils import BaiduTrans
 from dataset import *
 import ipywidgets as widgets
 
@@ -11,6 +10,7 @@ torch.set_float32_matmul_precision('medium')
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
+vicuna_chat_template = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
 
 class LLMPanel(widgets.VBox):
     def __init__(self, model_list, chat_template=None):
@@ -19,7 +19,8 @@ class LLMPanel(widgets.VBox):
         # model dropdown
         self.mt_dropdown = widgets.Dropdown(options=model_list, description='Model:', disabled=False,)
         self.mt = None
-        self.chat_template = chat_template if chat_template else "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
+        
+        self.chat_template = chat_template if chat_template else vicuna_chat_template
         # setup button
         self.setup_btn = widgets.Button(description="Setup everything", disabled=False,)
         self.setup_btn.on_click(self.setup_llm)
@@ -65,12 +66,14 @@ class LLMPanel(widgets.VBox):
         time_st = time.time()
         btn.description = "Loading model..."
         try:
-            self.mt = LLM.from_pretrained(model_name=self.mt_dropdown.value, fp16=(self.precision_tbtn.value == "half"))
+            self.mt = LLM.from_pretrained(
+                model_name=self.mt_dropdown.value, 
+                fp16=(self.precision_tbtn.value == "half"),
+                )
             self.device_tbtn.value = 'cpu'
             print(f"Everything is ready. Time cost: {time.time() - time_st:.2f}s")
         except Exception as e:
             print(f"Loading model failed: {e}")
-            return
         finally:
             btn.description = "Setup everything"
     
@@ -80,7 +83,7 @@ class LLMPanel(widgets.VBox):
             self.mt.to(change.new)
             torch.cuda.empty_cache() if change.new == 'cpu' else None
         except Exception as e:
-            print(f"Switch failed: {e}")
+            print(f"Switch device failed: {e}")
         finally:
             self.device_tbtn.disabled = False
 
