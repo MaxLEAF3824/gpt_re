@@ -69,17 +69,11 @@ class LLM(pl.LightningModule):
     
     def post_init(self):
         if not self.tokenizer.eos_token:
-            self.tokenizer.add_special_tokens({
-                "eos_token": "</s>",
-            })
+            self.tokenizer.add_special_tokens({"eos_token": "</s>"})
         if not self.tokenizer.bos_token:
-            self.tokenizer.add_special_tokens({
-                "bos_token": "<s>",
-            })
+            self.tokenizer.add_special_tokens({"bos_token": "<s>"})
         if not self.tokenizer.unk_token:
-            self.tokenizer.add_special_tokens({
-                "unk_token": "<unk>",
-            })
+            self.tokenizer.add_special_tokens({"unk_token": "<unk>"})
         if not self.tokenizer.pad_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = 'left'
@@ -95,10 +89,8 @@ class LLM(pl.LightningModule):
                 raise ValueError("illegal loss func")
         
         # configure module config
-        self.init_module_config(self.model)
-        
-    def init_module_config(self, model):
-        model_class_name = model.__class__.__name__
+        model_class_name = self.model.__class__.__name__
+        model = self.model
         cwd = os.path.abspath(os.path.dirname(__file__))
         config_file_path = f'{cwd}/module_config/{model_class_name}.json'
         if not os.path.exists(config_file_path):
@@ -110,6 +102,7 @@ class LLM(pl.LightningModule):
         self.ln_f = eval(f"model.{config['ln_f_module']}")
         self.lm_head = eval(f"model.{config['lm_head_module']}")
         self.embedding = eval(f"model.{config['embedding_module']}")
+        self.unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
         self.block = []
         self.attn = []
         self.mlp = []
@@ -121,7 +114,7 @@ class LLM(pl.LightningModule):
             self.mlp.append(eval(f"model.{config['mlp_module_tmp'].format(l)}"))
             self.ln_1.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
             self.ln_2.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
-    
+          
     def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
 
@@ -253,8 +246,7 @@ class LLM(pl.LightningModule):
         return answer
     
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
-        unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
-        
+        self.unembedding.to('cpu')
         inp = self.tokenizer(input_text, return_tensors='pt')
         hook_configs = [LLMHookConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
@@ -282,7 +274,7 @@ class LLM(pl.LightningModule):
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
-            cur_logits = unembedding(cur_matrix) # [num_modules, n_layer, seq_len, vocab_size]
+            cur_logits = self.unembedding(cur_matrix) # [num_modules, n_layer, seq_len, vocab_size]
             cur_prob = torch.softmax(cur_logits, dim=-1)  # [num_modules, n_layer, seq_len, vocab_size]
 
             # 计算层信息熵
@@ -291,7 +283,7 @@ class LLM(pl.LightningModule):
             # 计算层概率差
             block_hook0 = [h for h in hooker.hooks if h.config.module_name == 'block' and h.config.layer == 0][0]
             x0 = block_hook0.inputs[0]# [1, seq_len, hidden_size]
-            logits0 = unembedding(x0.unsqueeze(0).repeat(num_modules,1,1,1)) # [num_modules, 1, seq_len, vocab_size]
+            logits0 = self.unembedding(x0.unsqueeze(0).repeat(num_modules,1,1,1)) # [num_modules, 1, seq_len, vocab_size]
             cur_logits_extended = torch.cat([logits0, cur_logits], dim=1) # [num_modules, n_layer+1, seq_len, vocab_size]
             cur_diff = F.cross_entropy(cur_logits_extended[:,:-1].reshape(-1, cur_logits_extended.shape[-1]), cur_prob.reshape(-1, cur_prob.shape[-1]), reduction='none') # [num_modules * n_layer * seq_len]
             cur_diff = cur_diff.reshape(num_modules, self.n_layer, seq_len) # [num_modules, n_layer, seq_len]
@@ -304,7 +296,7 @@ class LLM(pl.LightningModule):
                 # 计算token在num_modules个模块中的概率变化之和
                 cur_token_prob_diff = (cur_token_prob[1:] - cur_token_prob[:-1]).abs().sum(dim=0).sum(dim=0) # [vocab_size]
                 # 按照变化之和从大到小排序
-                cur_token_udiff, cur_token_uids = torch.sort(cur_token_prob_diff, descending=True)
+                cur_token_udiff, cur_token_uids = torch.topk(cur_token_prob_diff, k=utokens_num)
                 cur_token_utokens = [self.idx2token[idx] for idx in cur_token_uids]
                 cur_utokens.append(cur_token_utokens)
                 cur_token_uprobs = cur_token_prob[:, :, cur_token_uids] # [num_modules, n_layer, vocab_size]
