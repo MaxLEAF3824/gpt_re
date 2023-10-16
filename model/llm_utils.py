@@ -9,7 +9,8 @@ import json
 import os
 from treelib import Tree
 import gpustat
-
+import sys
+import datetime
 
 def print_struct(data):
     def build_tree(data, tree, parent=None):
@@ -81,19 +82,52 @@ class BaiduTrans:
             result = result + res['dst'] + '\n'
         return result[:-1]
 
-class LeftPadding:
-    """Context manager that change padding side to left."""
+class PaddingSide:
+    """Context manager that change padding side to left or right."""
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, padding_side='left'):
         self.tokenizer = tokenizer
+        self.new_padding_side = padding_side
         self.ori_padding_side = self.tokenizer.padding_side
         
     def __enter__(self, *args, **kwargs):
-        self.tokenizer.padding_side = 'left'
+        self.tokenizer.padding_side = self.new_padding_side
 
     def __exit__(self, *args, **kwargs):
         self.tokenizer.padding_side = self.ori_padding_side
-    
+
+class Stdout2File:
+    """
+    Redirect stdout to file
+    """
+    def __init__(self, filename):
+        self.filename = filename
+        self.original_stdout = None
+
+    def __enter__(self):
+        self.original_stdout = sys.stdout
+        sys.stdout = self
+        self.file = open(self.filename, 'w', buffering=1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self.original_stdout
+        self.file.close()
+
+    def write(self, text):
+        now = datetime.datetime.now().strftime('[LINE][%H:%M:%S.%f]')
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            if line.strip():
+                if i == 0:
+                    self.file.write(f'{now} {line}\n')
+                else:
+                    self.file.write(f'{" "*len(now)} {line}\n')
+
+    def flush(self):
+        self.file.flush()
+
+
 class LoadWoInit:
     """Context manager that disable parameter initialization."""
 

@@ -40,7 +40,7 @@ def multigpu_generate(model, tok, dst, save_path, mnt, **kwargs):
             if osp.exists(f'{save_path}_{i}.json'):
                 os.remove(f'{save_path}_{i}.json')
     
-    output_texts = []
+    outputs = []
     
     for d in tqdm(local_dst, total=len(local_dst)):
         input_ids = tok(d['input'], return_tensors='pt')['input_ids']
@@ -49,24 +49,12 @@ def multigpu_generate(model, tok, dst, save_path, mnt, **kwargs):
         output = model.generate(input_ids=input_ids, max_new_tokens=mnt, do_sample=False)
         output_text = tok.decode(output[0,input_len:])
         d['output'] = output_text
-        output_texts.append(d)
+        outputs.append(d)
 
-    json.dump(output_texts, open(f'{save_path}_{local_rank}.json', 'w'), indent=4)
-    # torch.distributed.barrier()
-    
-    rank0_print("rank 0 collecting results...")
-    if local_rank == 0:
-        done = False
-        while not done:
-            done = sum([osp.exists(f'{save_path}_{i}.json') for i in range(world_size)]) == world_size
-            time.sleep(0.5)
-        output_texts = []
-        for i in range(world_size):
-            output_texts += json.load(open(f'{save_path}_{i}.json', 'r'))
-            os.remove(f'{save_path}_{i}.json')
-        json.dump(output_texts, open(save_path, 'w'), indent=4)
+    json.dump(outputs, open(f'{save_path}_{local_rank}.json', 'w'), indent=4)
 
-def multigpu_inference(model, tok, dst, save_path, local_bsz=4, **kwargs):
+
+def multigpu_inference(model, tok, dst, save_path, local_bsz=6,**kwargs):
     local_rank = get_local_rank()
     world_size = get_world_size()
     local_start = len(dst) // world_size*local_rank
@@ -78,42 +66,40 @@ def multigpu_inference(model, tok, dst, save_path, local_bsz=4, **kwargs):
             if osp.exists(f'{save_path}_{i}.json'):
                 os.remove(f'{save_path}_{i}.json')
     
-    output_loss = []
+    outputs = []
     
-    batch_local_dst = [local_dst[i:i+local_bsz] for i in range(0, len(local_dst), local_bsz)]
+    for d in tqdm(local_dst, total=len(local_dst)):
+        input_ids = tok(d['input'], return_tensors='pt')['input_ids']
+        prompt_ids = input_ids[...,: -1]
+        last_token_id = input_ids[...,-1]
+        labels = d['labels'] if isinstance(d['labels'], list) else [d['labels']]
+        batch_labels_list = [labels[i:i+local_bsz] for i in range(0, len(labels), local_bsz)]
+        past_key_values = model(input_ids=prompt_ids.to(model.device))['past_key_values']
+        
+        loss_list = []
+        
+        for batch_labels in batch_labels_list:
+            batch_label_length = [len(tok(l, add_special_tokens=False)['input_ids']) for l in batch_labels]
+            batch_label_ids = tok(batch_labels, return_tensors='pt', padding=True, add_special_tokens=False)['input_ids']
+            batch_input_ids = torch.cat((last_token_id.repeat(len(batch_labels),1), batch_label_ids), dim=-1)
+            batch_past_key_values = [(k.repeat(len(batch_labels),1,1,1), v.repeat(len(batch_labels),1,1,1)) for (k,v) in past_key_values]
+            batch_logits = model(input_ids=batch_input_ids.to(model.device), past_key_values=batch_past_key_values)['logits']
+            batch_label_ids = batch_label_ids.to(model.device)
+            
+            for i in range(len(batch_labels)):
+                length = batch_label_length[i]
+                label = batch_label_ids[i, :length]
+                pred = batch_logits[i, :length]
+                loss = torch.nn.functional.cross_entropy(pred, label)
+                loss_list.append(loss.item())
+        
+        d['label_loss'] = loss_list
+        outputs.append(d)
     
-    for batch_d in tqdm(batch_local_dst, total=len(batch_local_dst)):
-        input_lens = [len(tok(d['input'])['input_ids'] for d in batch_d)]
-        all_lens = [len(tok(d['input']+d['gt'])['input_ids'] for d in batch_d)]
-        input_ids = tok([d['input']+d['gt'] for d in batch_d], return_tensors='pt', padding=True)['input_ids']
-        output_logits = model(input_ids=input_ids.to(model.device))['logits']
-        for i in range(len(batch_d)):
-            start = input_lens[i]
-            end = all_lens[i]
-            d = batch_d[i]
-            label = input_ids[i, start:end+1]
-            pred = output_logits[i, start-1:end]
-            loss = torch.nn.functional.cross_entropy(pred, label)
-            d['loss'] = loss.item()
-            output_loss.append(d)
-    
-    json.dump(output_texts, open(f'{save_path}_{local_rank}.json', 'w'), indent=4)
-    # torch.distributed.barrier()
-    
-    rank0_print("rank 0 collecting results...")
-    if local_rank == 0:
-        done = False
-        while not done:
-            done = sum([osp.exists(f'{save_path}_{i}.json') for i in range(world_size)]) == world_size
-            time.sleep(0.5)
-        output_texts = []
-        for i in range(world_size):
-            output_texts += json.load(open(f'{save_path}_{i}.json', 'r'))
-            os.remove(f'{save_path}_{i}.json')
-        json.dump(output_texts, open(save_path, 'w'), indent=4)
+    json.dump(outputs, open(f'{save_path}_{local_rank}.json', 'w'), indent=4)
 
 
-def mgpu_infer(model_path, dst_path, func="generate", save_path="result.json", seed=42, **kwargs):
+def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=42, **kwargs):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -124,26 +110,55 @@ def mgpu_infer(model_path, dst_path, func="generate", save_path="result.json", s
     
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    if func == "gen":
+        func = multigpu_generate
+    elif func == 'infer':
+        func = multigpu_inference
+    else:
+        raise ValueError(f"func {func} not supported.")
+    
     rank0_print(f"model_path: {model_path}\n",
+                f"dst_path: {dst_path}\n",
                 f"save_path: {save_path}\n",
+                f"func: {func.__name__}\n",
+                f"seed: {seed}\n",
+                f"kwargs: {kwargs}\n",
                 f"bos_token:{tokenizer.bos_token_id} {tokenizer.bos_token}\n",
                 f"eos_token:{tokenizer.eos_token_id} {tokenizer.eos_token}\n",
+                f"pad_token:{tokenizer.pad_token_id} {tokenizer.pad_token}\n",
                 f"world_size: {world_size}\n",
-                f"CUDA_VISIBLE_DEVICES: {os.getenv('CUDA_VISIBLE_DEVICES', 'None')}\n",
-                f"kwargs: {kwargs}\n")
+                f"CUDA_VISIBLE_DEVICES: {os.getenv('CUDA_VISIBLE_DEVICES', 'None')}\n"
+                )
     
     with LoadWoInit():
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, trust_remote_code=True).cuda(local_rank)
+        model = AutoModelForCausalLM.from_pretrained(model_path, 
+                                                     torch_dtype=torch.float16, 
+                                                     trust_remote_code=True,
+                                                     use_f).cuda(local_rank)
     
     dst = json.load(open(dst_path))
-    rank0_print('dst length: ', len(dst))
+    rank0_print('dst size: ', len(dst))
     
-    if func == "generate":
-        multigpu_generate(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
-    elif func == 'inference':
-        multigpu_inference(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
+    func(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
     
-    rank0_print(f"all done, result saved to: {save_path}")
+    rank0_print("rank 0 waiting for collecting results...")
+    
+    if local_rank == 0:
+        done = False
+        while not done:
+            done = sum([osp.exists(f'{save_path}_{i}.json') for i in range(world_size)]) == world_size
+            time.sleep(0.5)
+        outputs = []
+        for i in range(world_size):
+            outputs += json.load(open(f'{save_path}_{i}.json', 'r'))
+            os.remove(f'{save_path}_{i}.json')
+        json.dump(outputs, open(save_path, 'w'), indent=4)
+    
+    rank0_print(f"all done.")
 
 if __name__ == '__main__':
     fire.Fire(mgpu_infer)

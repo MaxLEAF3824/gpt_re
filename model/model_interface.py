@@ -35,15 +35,18 @@ class LLM(pl.LightningModule):
     @classmethod
     def from_pretrained(cls, **config):
         self = cls(**config)
-        assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from pretrained"
+        assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from pretrained"
         torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
+        use_flash_attention_2 = False
+        if "llama" in self.hparams.model_path.lower() or "vicuna" in self.hparams.model_path.lower():
+            use_flash_attention_2 = True
         with LoadWoInit():
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.hparams.model_name, 
+                self.hparams.model_path, 
                 trust_remote_code=True,
-                torch_dtype=torch_dtype
+                torch_dtype=torch_dtype,
                 )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name, trust_remote_code=True, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_path, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
     
@@ -58,10 +61,10 @@ class LLM(pl.LightningModule):
     @classmethod
     def from_local(cls, **config):
         self = cls(**config)
-        assert hasattr(self.hparams, "model_name"), "you should specify a model name when using from local"
-        model_name = self.hparams.model_name
-        camel_name = ''.join([i.capitalize() for i in model_name.split('_')])
-        mt = getattr(importlib.import_module('.'+model_name, package=__package__), camel_name)()
+        assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from local"
+        model_path = self.hparams.model_path
+        camel_name = ''.join([i.capitalize() for i in model_path.split('_')])
+        mt = getattr(importlib.import_module('.'+model_path, package=__package__), camel_name)()
         self.model = mt.model
         self.tokenizer = mt.tokenizer
         self.post_init()

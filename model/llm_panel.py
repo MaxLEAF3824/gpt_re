@@ -12,6 +12,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 VICUNA_TEMPLATE = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
+INTERNLM_TEMPLATE = "<|User|>:{}<eoh>\n<|Bot|>:"
 
 class LLMPanel(widgets.VBox):
     def __init__(self, model_list, chat_template=None):
@@ -73,7 +74,7 @@ class LLMPanel(widgets.VBox):
         btn.description = "Loading model..."
         try:
             self.mt = LLM.from_pretrained(
-                model_name=self.mt_dropdown.value, 
+                model_path=self.mt_dropdown.value, 
                 fp16=(self.precision_tbtn.value == "half"),
                 )
             self.device_tbtn.value = 'cpu'

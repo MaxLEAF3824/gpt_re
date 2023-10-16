@@ -14,4 +14,4 @@
 
 from .model_interface import LLM
 from .llm_utils import *
-from .llm_panel import LLMPanel
+from .llm_panel import *
