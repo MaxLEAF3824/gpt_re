@@ -113,10 +113,11 @@ def multigpu_inference(model, tok, dst, save_path, local_bsz=4, **kwargs):
         json.dump(output_texts, open(save_path, 'w'), indent=4)
 
 
-def main(model_path, dst_path, func="generate", save_path="result.json", seed=42, **kwargs):
+def mgpu_infer(model_path, dst_path, func="generate", save_path="result.json", seed=42, **kwargs):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    
     torch.distributed.init_process_group(backend="nccl")
     world_size = get_world_size()
     local_rank = get_local_rank()
@@ -141,6 +142,8 @@ def main(model_path, dst_path, func="generate", save_path="result.json", seed=42
         multigpu_generate(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
     elif func == 'inference':
         multigpu_inference(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
+    
+    rank0_print(f"all done, result saved to: {save_path}")
 
 if __name__ == '__main__':
-    fire.Fire(main)
+    fire.Fire(mgpu_infer)

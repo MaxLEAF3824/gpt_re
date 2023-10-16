@@ -1,8 +1,9 @@
 import os
 import time
 import torch
-from .model_interface import *
-from .llm_utils import BaiduTrans
+
+from .model_interface import LLM
+from .llm_utils import BaiduTrans, get_free_gpus
 from dataset import *
 import ipywidgets as widgets
 
@@ -10,17 +11,19 @@ torch.set_float32_matmul_precision('medium')
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-vicuna_chat_template = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
+VICUNA_TEMPLATE = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
 
 class LLMPanel(widgets.VBox):
     def __init__(self, model_list, chat_template=None):
         super(LLMPanel, self).__init__()
         self.translator = BaiduTrans()
+        self.free_gpus = get_free_gpus()
+        self.chat_template = chat_template if chat_template else VICUNA_TEMPLATE
+        
         # model dropdown
         self.mt_dropdown = widgets.Dropdown(options=model_list, description='Model:', disabled=False,)
         self.mt = None
         
-        self.chat_template = chat_template if chat_template else vicuna_chat_template
         # setup button
         self.setup_btn = widgets.Button(description="Setup everything", disabled=False,)
         self.setup_btn.on_click(self.setup_llm)
@@ -29,6 +32,9 @@ class LLMPanel(widgets.VBox):
         self.device_tbtn = widgets.ToggleButtons(options=['cpu', f'cuda',], disabled=False,)
         self.device_tbtn.observe(self.switch_device, names='value')
 
+        # free gpu list
+        self.free_gpus_dropdown = widgets.Dropdown(options=self.free_gpus, description='Free GPUs:', disabled=False,)
+        
         # switch precision
         self.precision_tbtn = widgets.ToggleButtons(options=['half', 'float'], disabled=False,)
         self.precision_tbtn.observe(self.switch_precision, names='value')
@@ -58,7 +64,7 @@ class LLMPanel(widgets.VBox):
         self.chat_checkbox = widgets.Checkbox(value=False,description='chat mode',disabled=False,)
         
         # pannel layout
-        self.control_panel = widgets.HBox([self.mt_dropdown, self.setup_btn, self.precision_tbtn, self.device_tbtn])
+        self.control_panel = widgets.HBox([self.mt_dropdown, self.setup_btn, self.precision_tbtn, self.device_tbtn, self.free_gpus_dropdown])
         self.generate_panel = widgets.HBox([self.input_textarea, widgets.VBox([self.mnt_slider, self.tem_slider, self.sample_checkbox, self.chat_checkbox, self.submit_btn, self.translate_btn,]), self.output_textarea])
         self.children = [self.control_panel, self.generate_panel]
     
@@ -80,8 +86,11 @@ class LLMPanel(widgets.VBox):
     def switch_device(self, change):
         self.device_tbtn.disabled = True
         try:
-            self.mt.to(change.new)
-            torch.cuda.empty_cache() if change.new == 'cpu' else None
+            if change.new == 'cpu':
+                self.mt.cpu()
+                torch.cuda.empty_cache()
+            else:
+                self.mt.cuda(self.free_gpus_dropdown.value)
         except Exception as e:
             print(f"Switch device failed: {e}")
         finally:
