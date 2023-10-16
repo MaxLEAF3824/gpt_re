@@ -1,11 +1,10 @@
 import os
 import time
 import torch
+import ipywidgets as widgets
 
 from .model_interface import LLM
 from .llm_utils import BaiduTrans, get_free_gpus
-from dataset import *
-import ipywidgets as widgets
 
 torch.set_float32_matmul_precision('medium')
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -72,11 +71,9 @@ class LLMPanel(widgets.VBox):
     def setup_llm(self, btn):
         time_st = time.time()
         btn.description = "Loading model..."
+        torch_dtype = torch.float16 if self.precision_tbtn.value == "half" else torch.float32
         try:
-            self.mt = LLM.from_pretrained(
-                model_path=self.mt_dropdown.value, 
-                fp16=(self.precision_tbtn.value == "half"),
-                )
+            self.mt = LLM.from_pretrained(model_path=self.mt_dropdown.value, torch_dtype=torch_dtype)
             self.device_tbtn.value = 'cpu'
             print(f"Everything is ready. Time cost: {time.time() - time_st:.2f}s")
         except Exception as e:

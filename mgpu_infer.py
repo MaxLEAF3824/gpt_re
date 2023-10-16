@@ -1,18 +1,12 @@
 import os
 import os.path as osp
 import fire
-from pprint import pprint
 import torch
 import json
-import jsonlines
 import random
-from transformers import GenerationConfig,AutoTokenizer,AutoModelForCausalLM
-import pickle
-import csv
 from tqdm import tqdm
 import time
-from datasets import load_dataset
-from llm_utils import *
+from model.model_interface import LLM
 
 
 def get_local_rank():
@@ -108,12 +102,6 @@ def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=4
     world_size = get_world_size()
     local_rank = get_local_rank()
     
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
-    
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
     if func == "gen":
         func = multigpu_generate
     elif func == 'infer':
@@ -127,23 +115,25 @@ def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=4
                 f"func: {func.__name__}\n",
                 f"seed: {seed}\n",
                 f"kwargs: {kwargs}\n",
-                f"bos_token:{tokenizer.bos_token_id} {tokenizer.bos_token}\n",
-                f"eos_token:{tokenizer.eos_token_id} {tokenizer.eos_token}\n",
-                f"pad_token:{tokenizer.pad_token_id} {tokenizer.pad_token}\n",
                 f"world_size: {world_size}\n",
                 f"CUDA_VISIBLE_DEVICES: {os.getenv('CUDA_VISIBLE_DEVICES', 'None')}\n"
                 )
     
-    with LoadWoInit():
-        model = AutoModelForCausalLM.from_pretrained(model_path, 
-                                                     torch_dtype=torch.float16, 
-                                                     trust_remote_code=True,
-                                                     use_f).cuda(local_rank)
+    mt = LLM.from_pretrained(model_path=model_path, torch_dtype=torch.float16)
+    model = mt.model
+    tok = mt.tok
+    
+    if not tok.pad_token:
+        tok.pad_token = tok.eos_token
+        tok.pad_token_id = tok.eos_token_id
+    
+    model.cuda(local_rank)
     
     dst = json.load(open(dst_path))
+    
     rank0_print('dst size: ', len(dst))
     
-    func(model=model, tok=tokenizer, dst=dst, save_path=save_path, **kwargs)
+    func(model=model, tok=tok, dst=dst, save_path=save_path, **kwargs)
     
     rank0_print("rank 0 waiting for collecting results...")
     

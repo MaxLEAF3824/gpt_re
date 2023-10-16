@@ -1,6 +1,5 @@
 import torch
-from typing import Dict, List, Union
-from typing import Optional, Callable
+from typing import Dict, List, Union, Optional, Callable
 from dataclasses import dataclass
 import random
 import hashlib
@@ -127,7 +126,6 @@ class Stdout2File:
     def flush(self):
         self.file.flush()
 
-
 class LoadWoInit:
     """Context manager that disable parameter initialization."""
 
@@ -227,7 +225,6 @@ class LLMHook:
     def reset(self):
         self.inputs.clear()
         self.outputs.clear()
-
 
 class LLMHooker:
     """Context manager that add multiple hooks to LLM."""

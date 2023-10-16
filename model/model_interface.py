@@ -1,18 +1,15 @@
-from typing import Dict, List, Union
+import os
+import json
 import torch
-from copy import deepcopy
-from pyecharts import options as opts
-from pyecharts.charts import Bar, Timeline, Tab, Page, Line
 import torch.nn as nn
+from copy import deepcopy
 import torch.nn.functional as F
-import importlib
 import torch.optim.lr_scheduler as lrs
-from torch import ones_like, optim, Tensor, zeros_like
+from pyecharts import options as opts
+from pyecharts.charts import Bar, Timeline, Tab, Line
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import pytorch_lightning as pl
-import os
-import types
-import json
+
 from .llm_utils import *
 
 class Unembedding(nn.Module):
@@ -36,50 +33,31 @@ class LLM(pl.LightningModule):
     def from_pretrained(cls, **config):
         self = cls(**config)
         assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from pretrained"
-        torch_dtype = torch.float16 if getattr(self.hparams, 'fp16', False) else torch.float32
-        use_flash_attention_2 = False
-        if "llama" in self.hparams.model_path.lower() or "vicuna" in self.hparams.model_path.lower():
-            use_flash_attention_2 = True
+        torch_dtype = self.hparams.torch_dtype if hasattr(self.hparams, "torch_dtype") else torch.float16
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.hparams.model_path, 
-                trust_remote_code=True,
-                torch_dtype=torch_dtype,
-                )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_path, trust_remote_code=True, use_fast=True)
+            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_path, trust_remote_code=True, torch_dtype=torch_dtype)
+            self.tok = AutoTokenizer.from_pretrained(self.hparams.model_path, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
     
     @classmethod
-    def from_mt(cls, model, tokenizer):
-        self = cls()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.post_init()
-        return self
-    
-    @classmethod
-    def from_local(cls, **config):
+    def from_mt(cls, model, tok, **config):
         self = cls(**config)
-        assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from local"
-        model_path = self.hparams.model_path
-        camel_name = ''.join([i.capitalize() for i in model_path.split('_')])
-        mt = getattr(importlib.import_module('.'+model_path, package=__package__), camel_name)()
-        self.model = mt.model
-        self.tokenizer = mt.tokenizer
+        self.model = model
+        self.tok = tok
         self.post_init()
         return self
     
     def post_init(self):
-        if not self.tokenizer.eos_token:
-            self.tokenizer.add_special_tokens({"eos_token": "</s>"})
-        if not self.tokenizer.bos_token:
-            self.tokenizer.add_special_tokens({"bos_token": "<s>"})
-        if not self.tokenizer.unk_token:
-            self.tokenizer.add_special_tokens({"unk_token": "<unk>"})
-        if not self.tokenizer.pad_token:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = 'left'
+        if not self.tok.eos_token:
+            self.tok.add_special_tokens({"eos_token": "</s>"})
+        if not self.tok.bos_token:
+            self.tok.add_special_tokens({"bos_token": "<s>"})
+        if not self.tok.unk_token:
+            self.tok.add_special_tokens({"unk_token": "<unk>"})
+        if not self.tok.pad_token:
+            self.tok.pad_token = self.tok.eos_token
+        # self.tok.padding_side = 'left'
         
         # configure loss function
         if not hasattr(self.hparams, "loss_func"):
@@ -100,7 +78,7 @@ class LLM(pl.LightningModule):
             raise ValueError(f"module config file not found, you should add a {model_class_name}.json in model/module_config/")
         config = json.load(open(config_file_path))
         self.module_config = config
-        self.idx2token = [f"{i}-{self.tokenizer.decode(i)}" for i in range(self.tokenizer.vocab_size)]
+        self.idx2token = [f"{i}-{self.tok.decode(i)}" for i in range(self.tok.vocab_size)]
         self.n_layer = eval(f"model.{config['n_layer']}")
         self.ln_f = eval(f"model.{config['ln_f_module']}")
         self.lm_head = eval(f"model.{config['lm_head_module']}")
@@ -118,32 +96,13 @@ class LLM(pl.LightningModule):
             self.ln_1.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
             self.ln_2.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
           
-    def forward(self, input_ids: Tensor, attention_mask: Tensor = None, labels: Tensor = None, **kwargs):
-        return self.model(input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
+    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
 
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
         input_ids, attention_mask = batch[0], batch[1]
         labels = batch[2] if len(batch) > 2 else None
         return self(input_ids, attention_mask=attention_mask, labels=labels)
-
-    def set_func(self, func_name, func):
-        setattr(self, func_name, types.MethodType(func, self))
-
-    def predict_next_token(self, input_texts):
-        '''batch: str or list of str'''
-        input_texts = [input_texts] if isinstance(input_texts, str) else input_texts
-        tok_res = self.tokenizer(input_texts, padding=True, return_tensors='pt')
-        input_ids, attention_mask = tok_res.input_ids, tok_res.attention_mask
-        res = self(input_ids, attention_mask=attention_mask)
-        pred_idxs = torch.argmax(res['logits'][:, -1, :], dim=1).unsqueeze(1)
-        next_token = self.tokenizer.batch_decode(pred_idxs)
-        return next_token
-
-    def _acc(self, shift_logits, label):
-        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-        total_num = torch.argwhere(label != -100).shape[0]
-        correct_num = torch.sum(pred == label).item()
-        return correct_num / total_num
 
     def training_step(self, batch, batch_idx):
         '''batch: (input_ids, attention_mask, labels) **padding already** '''
@@ -164,8 +123,11 @@ class LLM(pl.LightningModule):
         else:
             loss = self.loss_func(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        acc = self._acc(shift_logits, shift_labels)
+        
+        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
+        total_num = torch.argwhere(shift_labels != -100).shape[0]
+        correct_num = torch.sum(pred == shift_labels).item()
+        acc = correct_num / total_num
 
         self.log('train_loss', loss, on_step=True,
                  on_epoch=True, sync_dist=True, prog_bar=True)
@@ -188,7 +150,7 @@ class LLM(pl.LightningModule):
         shift_logits = lm_logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        if isinstance(res.get('loss'), Tensor):
+        if isinstance(res.get('loss'), torch.Tensor):
             loss = res['loss']
         else:
             loss = self.loss_func(
@@ -197,7 +159,12 @@ class LLM(pl.LightningModule):
         pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
         total_num = torch.argwhere(shift_labels != -100).shape[0]
         correct_num = torch.sum(pred == shift_labels).item()
-        acc = self._acc(shift_logits, shift_labels)
+        
+        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
+        total_num = torch.argwhere(shift_labels != -100).shape[0]
+        correct_num = torch.sum(pred == shift_labels).item()
+        acc = correct_num / total_num
+        
         self.log('val_loss', loss, on_step=False,
                  on_epoch=True, sync_dist=True, prog_bar=True)
         self.log('val_acc', acc, on_step=False,
@@ -206,7 +173,6 @@ class LLM(pl.LightningModule):
         return (correct_num, total_num)
 
     def test_step(self, batch, batch_idx):
-        # Here we just reuse the validation_step for testing
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
@@ -214,7 +180,7 @@ class LLM(pl.LightningModule):
         lr = self.hparams.lr if hasattr(self.hparams, "lr") else 1e-4
         weight_decay = self.hparams.weight_decay if hasattr(
             self.hparams, 'weight_decay') else 1
-        optimizer = optim.AdamW(self.trainer.model.parameters(
+        optimizer = torch.optim.AdamW(self.trainer.model.parameters(
         ), lr=lr, weight_decay=weight_decay, fused=True)
 
         # scheduler
@@ -236,7 +202,7 @@ class LLM(pl.LightningModule):
             return optimizer
 
     def generate(self, input_texts, cut_input=False, **generate_kwargs):
-        inp = self.tokenizer(input_texts, padding=True, return_tensors='pt')
+        inp = self.tok(input_texts, padding=True, return_tensors='pt')
         input_ids, attention_mask = inp.input_ids, inp.attention_mask
         if 'max_new_tokens' not in generate_kwargs:
             generate_kwargs['max_new_tokens'] = 20
@@ -245,12 +211,12 @@ class LLM(pl.LightningModule):
         output_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         if cut_input:
             output_ids = output_ids[:, input_ids.shape[-1]:]
-        answer = self.tokenizer.batch_decode(output_ids)
+        answer = self.tok.batch_decode(output_ids)
         return answer
     
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
         self.unembedding.to('cpu')
-        inp = self.tokenizer(input_text, return_tensors='pt')
+        inp = self.tok(input_text, return_tensors='pt')
         hook_configs = [LLMHookConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
         # hook_configs += [LLMHookConfig(module_name="attn_weights",layer=l, float=True, detach=True,output_save_func=lambda m,i,o: o[1]) for l in range(self.n_layer)]
@@ -265,7 +231,7 @@ class LLM(pl.LightningModule):
                     hook.inputs= [torch.cat([o for o in hook.inputs], dim=1)]
             
             # 保存generate的句子和下一个token
-            out_tokens = self.tokenizer.batch_decode(output_ids[0])
+            out_tokens = self.tok.batch_decode(output_ids[0])
             cur_sentence = out_tokens[:-1]
             
             # 获取当前句子的关于每一层，每一个模块合并后的完整matrix [num_modules, n_layer, seq_len, hidden_size]
