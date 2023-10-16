@@ -293,7 +293,7 @@ class LLM(pl.LightningModule):
             cur_uprobs = [] # [seq_len, num_modules, n_layer, vocab_size]
             for j in range(seq_len):
                 cur_token_prob = cur_prob[:,:,j,:] # [num_modules, n_layer, vocab_size]
-                # 计算token在num_modules个模块中的概率变化之和
+                # 计算token在num_modules个模块中的概率变化之和，【这一行是代码的速度瓶颈】
                 cur_token_prob_diff = (cur_token_prob[1:] - cur_token_prob[:-1]).abs().sum(dim=0).sum(dim=0) # [vocab_size]
                 # 按照变化之和从大到小排序
                 cur_token_udiff, cur_token_uids = torch.topk(cur_token_prob_diff, k=utokens_num)

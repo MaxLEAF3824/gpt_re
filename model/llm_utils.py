@@ -8,6 +8,8 @@ import requests
 import json
 import os
 from treelib import Tree
+import gpustat
+
 
 def print_struct(data):
     def build_tree(data, tree, parent=None):
@@ -34,6 +36,13 @@ def print_struct(data):
     build_tree(data, tree, parent=0)
     tree.show()
     
+def get_free_gpus():
+    free_gpu_indexs = []
+    gpus = gpustat.new_query()
+    for gpu in gpus:
+        if gpu.memory_used == 0 or (gpu.utilization <= 10 and gpu.memory_used < 5000):
+            free_gpu_indexs.append(gpu.index)
+    return free_gpu_indexs
 
 class BaiduTrans:
     baidu_api = "https://fanyi-api.baidu.com/api/trans/vip/translate"
