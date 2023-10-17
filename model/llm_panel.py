@@ -18,6 +18,8 @@ class LLMPanel(widgets.VBox):
         super(LLMPanel, self).__init__()
         self.translator = BaiduTrans()
         self.free_gpus = get_free_gpus()
+        if not self.free_gpus:
+            self.free_gpus = [0]
         self.chat_template = chat_template if chat_template else VICUNA_TEMPLATE
         
         # model dropdown

@@ -150,5 +150,6 @@ def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=4
     
     rank0_print(f"all done.")
 
+
 if __name__ == '__main__':
     fire.Fire(mgpu_infer)
