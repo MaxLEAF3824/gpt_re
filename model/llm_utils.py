@@ -10,6 +10,43 @@ from treelib import Tree
 import gpustat
 import sys
 import datetime
+import openai
+import concurrent.futures
+from tqdm.auto import tqdm
+from copy import deepcopy
+import logging
+
+def multithread_query_chatgpt(inputs: List[Dict], thread_num=4, max_round=10, **kwargs):
+    all_answers = []
+    round = 1
+    while len(inputs) > 0 or round > max_round:
+        def get_output(input):
+            query_config = dict(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": input}],
+                **kwargs
+            )
+            response = openai.ChatCompletion.create(**query_config)
+            return response.choices[0].message['content']
+        chatgpt_answers = []
+        error_inputs = []
+        with concurrent.futures.ThreadPoolExecutor(thread_num) as executor:
+            future_to_input = {executor.submit(get_output, i['query_input']): i for i in inputs}
+            for future in tqdm(concurrent.futures.as_completed(future_to_input),total=len(inputs)):
+                input = future_to_input[future]
+                try:
+                    query_output = future.result()
+                    new_input = deepcopy(input)
+                    new_input['query_output'] = query_output
+                    chatgpt_answers.append(new_input)
+                except Exception as exc:
+                    error_inputs.append(input)
+                    logging.info(f'An exception occurred: {exc}')
+        logging.info(f"round: {round} error_inputs: {len(error_inputs)}")
+        all_answers.extend(chatgpt_answers)
+        inputs = error_inputs
+        round += 1
+    return all_answers
 
 def print_struct(data):
     def build_tree(data, tree, parent=None):
@@ -188,7 +225,6 @@ class LLMHookConfig(Dict):
     detach: bool = False
     device: str = "cpu"
     
-
 class LLMHook:
     def __init__(self, module, config: LLMHookConfig):
         self.module = module
