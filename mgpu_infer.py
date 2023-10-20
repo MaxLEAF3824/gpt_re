@@ -4,7 +4,7 @@ import fire
 import torch
 import json
 import random
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import time
 from model.model_interface import LLM
 

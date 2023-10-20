@@ -2,7 +2,6 @@ import os
 import time
 import torch
 import ipywidgets as widgets
-
 from .model_interface import LLM
 from .llm_utils import BaiduTrans, get_free_gpus
 
@@ -23,23 +22,23 @@ class LLMPanel(widgets.VBox):
         self.chat_template = chat_template if chat_template else VICUNA_TEMPLATE
         
         # model dropdown
-        self.mt_dropdown = widgets.Dropdown(options=model_list, description='Model:', disabled=False,)
+        self.mt_dropdown = widgets.Dropdown(options=list(model_list.items()), description='Model:', disabled=False,)
         self.mt = None
         
         # setup button
         self.setup_btn = widgets.Button(description="Setup everything", disabled=False,)
-        self.setup_btn.on_click(self.setup_llm)
+        self.setup_btn.on_click(self.setup_llm_func)
 
         # switch deivce
         self.device_tbtn = widgets.ToggleButtons(options=['cpu', f'cuda',], disabled=False,)
-        self.device_tbtn.observe(self.switch_device, names='value')
+        self.device_tbtn.observe(self.switch_device_func, names='value')
 
         # free gpu list
         self.free_gpus_dropdown = widgets.Dropdown(options=self.free_gpus, description='Free GPUs:', disabled=False,)
         
         # switch precision
         self.precision_tbtn = widgets.ToggleButtons(options=['half', 'float'], disabled=False,)
-        self.precision_tbtn.observe(self.switch_precision, names='value')
+        self.precision_tbtn.observe(self.switch_precision_func, names='value')
 
         # max new token slider
         self.mnt_slider = widgets.IntSlider(value=64,min=1,max=2048,step=1,description='new token:',disabled=False,)
@@ -56,11 +55,11 @@ class LLMPanel(widgets.VBox):
 
         # submit button
         self.submit_btn = widgets.Button(description="generate",disabled=False,)
-        self.submit_btn.on_click(self.generate)
+        self.submit_btn.on_click(self.generate_func)
         
         # translate button
         self.translate_btn = widgets.Button(description="translate",disabled=False,)
-        self.translate_btn.on_click(self.translate)
+        self.translate_btn.on_click(self.translate_func)
 
         # chat mode checkbox
         self.chat_checkbox = widgets.Checkbox(value=False,description='chat mode',disabled=False,)
@@ -70,12 +69,14 @@ class LLMPanel(widgets.VBox):
         self.generate_panel = widgets.HBox([self.input_textarea, widgets.VBox([self.mnt_slider, self.tem_slider, self.sample_checkbox, self.chat_checkbox, self.submit_btn, self.translate_btn,]), self.output_textarea])
         self.children = [self.control_panel, self.generate_panel]
     
-    def setup_llm(self, btn):
+    def setup_llm_func(self, btn):
         time_st = time.time()
         btn.description = "Loading model..."
         torch_dtype = torch.float16 if self.precision_tbtn.value == "half" else torch.float32
+        mt_path = self.mt_dropdown.value
+        use_flash_attention_2 = True if "llama" in mt_path or "vicuna" in mt_path else False
         try:
-            self.mt = LLM.from_pretrained(model_path=self.mt_dropdown.value, torch_dtype=torch_dtype)
+            self.mt = LLM.from_pretrained(model_path=self.mt_dropdown.value, torch_dtype=torch_dtype, use_flash_attention_2=use_flash_attention_2)
             self.device_tbtn.value = 'cpu'
             print(f"Everything is ready. Time cost: {time.time() - time_st:.2f}s")
         except Exception as e:
@@ -83,7 +84,7 @@ class LLMPanel(widgets.VBox):
         finally:
             btn.description = "Setup everything"
     
-    def switch_device(self, change):
+    def switch_device_func(self, change):
         self.device_tbtn.disabled = True
         try:
             if change.new == 'cpu':
@@ -96,7 +97,7 @@ class LLMPanel(widgets.VBox):
         finally:
             self.device_tbtn.disabled = False
 
-    def switch_precision(self, change):
+    def switch_precision_func(self, change):
         self.precision_tbtn.disabled = True
         try:
             if self.mt is not None:
@@ -106,7 +107,7 @@ class LLMPanel(widgets.VBox):
         finally:
             self.precision_tbtn.disabled = False
 
-    def generate(self, btn):
+    def generate_func(self, btn):
         btn.disabled = True
         self.submit_btn.description = "Generating..."
         input_text = self.chat_template.format(self.input_textarea.value) if self.chat_checkbox.value else self.input_textarea.value
@@ -126,7 +127,7 @@ class LLMPanel(widgets.VBox):
             self.submit_btn.description = "generate"
 
 
-    def translate(self, btn):
+    def translate_func(self, btn):
         btn.disabled = True
         btn.description = "translating..."
         try:
@@ -139,3 +140,14 @@ class LLMPanel(widgets.VBox):
         finally:
             btn.description = "translate"
             btn.disabled = False
+    
+    def panel_generate(self, input_text, chat, mnt, sample, temperature=1.0):
+        self.chat_checkbox.value=chat
+        self.mnt_slider.value=mnt
+        self.sample_checkbox.value=sample
+        self.tem_slider.value=temperature
+        self.input_textarea.value=input_text
+        self.submit_btn.click()
+        output_text = self.output_textarea.value
+        output_text = output_text.replace(self.mt.tok.eos_token,"").strip()
+        return output_text

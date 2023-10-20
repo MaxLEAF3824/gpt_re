@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from copy import deepcopy
 import logging
 
-def multithread_query_chatgpt(inputs: List[Dict], thread_num=4, max_round=10, **kwargs):
+def multithread_query_chatgpt(inputs: List[Dict], thread_num=1, max_round=10, temperature=1.0, **kwargs):
     all_answers = []
     round = 1
     while len(inputs) > 0 or round > max_round:
@@ -24,6 +24,7 @@ def multithread_query_chatgpt(inputs: List[Dict], thread_num=4, max_round=10, **
             query_config = dict(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": input}],
+                temperature=temperature,
                 **kwargs
             )
             response = openai.ChatCompletion.create(**query_config)
@@ -77,7 +78,7 @@ def get_free_gpus():
     free_gpu_indexs = []
     gpus = gpustat.new_query()
     for gpu in gpus:
-        if gpu.memory_used == 0 or (gpu.utilization <= 10 and gpu.memory_used < 5000):
+        if gpu.utilization <= 10 and gpu.memory_used < 5000:
             free_gpu_indexs.append(gpu.index)
     return free_gpu_indexs
 
@@ -209,9 +210,8 @@ def recursive_copy(x, float, clone, detach, device):
         return None
     else:
         assert False, f"Unknown type {type(x)} cannot be broken into tensors."
-
 @dataclass
-class LLMHookConfig(Dict):
+class LLMHookerConfig(Dict):
     """Config for LLMHook."""
     module_name: str
     layer: int = 0
@@ -222,11 +222,11 @@ class LLMHookConfig(Dict):
     edit_output: Optional[Callable] = None
     float: bool = False
     clone: bool = False
-    detach: bool = False
+    detach: bool = True
     device: str = "cpu"
     
 class LLMHook:
-    def __init__(self, module, config: LLMHookConfig):
+    def __init__(self, module, config: LLMHookerConfig):
         self.module = module
         self.config = config
         self.inputs = []
@@ -265,7 +265,7 @@ class LLMHook:
 class LLMHooker:
     """Context manager that add multiple hooks to LLM."""
     
-    def __init__(self, mt, config: Union[List[LLMHookConfig], LLMHookConfig]):
+    def __init__(self, mt, config: Union[List[LLMHookerConfig], LLMHookerConfig]):
         self.mt = mt
         self.config_list = config if isinstance(config, list) else [config]
         self.hooks = []

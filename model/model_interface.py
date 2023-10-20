@@ -33,9 +33,10 @@ class LLM(pl.LightningModule):
     def from_pretrained(cls, **config):
         self = cls(**config)
         assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from pretrained"
+        use_flash_attention_2 = getattr(self.hparams, "use_flash_attention_2", False)
         torch_dtype = self.hparams.torch_dtype if hasattr(self.hparams, "torch_dtype") else torch.float16
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_path, trust_remote_code=True, torch_dtype=torch_dtype)
+            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_path, trust_remote_code=True, torch_dtype=torch_dtype,use_flash_attention_2=use_flash_attention_2)
             self.tok = AutoTokenizer.from_pretrained(self.hparams.model_path, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
@@ -217,10 +218,10 @@ class LLM(pl.LightningModule):
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
         self.unembedding.to('cpu')
         inp = self.tok(input_text, return_tensors='pt')
-        hook_configs = [LLMHookConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
+        hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
-        # hook_configs += [LLMHookConfig(module_name="attn_weights",layer=l, float=True, detach=True,output_save_func=lambda m,i,o: o[1]) for l in range(self.n_layer)]
-        with LLMHooker(self, hook_configs) as hooker:
+        # hook_configs += [LLMHookerConfig(module_name="attn_weights",layer=l, float=True, detach=True,output_save_func=lambda m,i,o: o[1]) for l in range(self.n_layer)]
+        with torch.no_grad(), LLMHooker(self, hook_configs) as hooker:
             gen_wargs['max_new_tokens'] = 1 if 'max_new_tokens' not in gen_wargs else gen_wargs['max_new_tokens']
             output_ids = self.model.generate(input_ids=inp['input_ids'].to(self.model.device), attention_mask=inp['attention_mask'].to(self.model.device), **gen_wargs)
             
