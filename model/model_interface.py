@@ -9,7 +9,7 @@ from pyecharts import options as opts
 from pyecharts.charts import Bar, Timeline, Tab, Line
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import pytorch_lightning as pl
-
+from .llm_hooker import *
 from .llm_utils import *
 
 class Unembedding(nn.Module):
@@ -220,7 +220,6 @@ class LLM(pl.LightningModule):
         inp = self.tok(input_text, return_tensors='pt')
         hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
-        # hook_configs += [LLMHookerConfig(module_name="attn_weights",layer=l, float=True, detach=True,output_save_func=lambda m,i,o: o[1]) for l in range(self.n_layer)]
         with torch.no_grad(), LLMHooker(self, hook_configs) as hooker:
             gen_wargs['max_new_tokens'] = 1 if 'max_new_tokens' not in gen_wargs else gen_wargs['max_new_tokens']
             output_ids = self.model.generate(input_ids=inp['input_ids'].to(self.model.device), attention_mask=inp['attention_mask'].to(self.model.device), **gen_wargs)

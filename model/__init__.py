@@ -15,3 +15,4 @@
 from .model_interface import LLM
 from .llm_utils import *
 from .llm_panel import *
+from .llm_hooker import *

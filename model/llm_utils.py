@@ -1,6 +1,5 @@
 import torch
-from typing import Dict, List, Union, Optional, Callable
-from dataclasses import dataclass
+from typing import Dict, List
 import random
 import hashlib
 import requests
@@ -119,32 +118,19 @@ class BaiduTrans:
             result = result + res['dst'] + '\n'
         return result[:-1]
 
-class PaddingSide:
-    """Context manager that change padding side to left or right."""
-
-    def __init__(self, tokenizer, padding_side='left'):
-        self.tokenizer = tokenizer
-        self.new_padding_side = padding_side
-        self.ori_padding_side = self.tokenizer.padding_side
-        
-    def __enter__(self, *args, **kwargs):
-        self.tokenizer.padding_side = self.new_padding_side
-
-    def __exit__(self, *args, **kwargs):
-        self.tokenizer.padding_side = self.ori_padding_side
-
 class Stdout2File:
     """
     Redirect stdout to file
     """
-    def __init__(self, filename):
+    def __init__(self, filename, mode='w'):
         self.filename = filename
         self.original_stdout = None
+        self.mode = mode
 
     def __enter__(self):
         self.original_stdout = sys.stdout
         sys.stdout = self
-        self.file = open(self.filename, 'w', buffering=1)
+        self.file = open(self.filename, self.mode, buffering=1)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -163,6 +149,20 @@ class Stdout2File:
 
     def flush(self):
         self.file.flush()
+
+class PaddingSide:
+    """Context manager that change padding side to left or right."""
+
+    def __init__(self, tokenizer, padding_side='left'):
+        self.tokenizer = tokenizer
+        self.new_padding_side = padding_side
+        self.ori_padding_side = self.tokenizer.padding_side
+        
+    def __enter__(self, *args, **kwargs):
+        self.tokenizer.padding_side = self.new_padding_side
+
+    def __exit__(self, *args, **kwargs):
+        self.tokenizer.padding_side = self.ori_padding_side
 
 class LoadWoInit:
     """Context manager that disable parameter initialization."""
@@ -193,103 +193,3 @@ class LoadWoInit:
         torch.nn.init.normal_ = self.normal_
         torch.nn.init.kaiming_uniform_ = self.kaiming_uniform_
         torch.nn.init.kaiming_normal_ = self.kaiming_normal_
-
-def recursive_copy(x, float, clone, detach, device):
-    if isinstance(x, torch.Tensor):
-        x = x.to(device)
-        x = x.detach() if detach else x
-        x = x.clone() if clone else x
-        x = x.float() if float else x
-        return x
-    # Only dicts, lists, and tuples (and subclasses) can be copied.
-    if isinstance(x, dict):
-        return type(x)({k: recursive_copy(v, float, clone, detach, device) for k, v in x.items()})
-    elif isinstance(x, (list, tuple)):
-        return type(x)([recursive_copy(v, float, clone, detach, device) for v in x])
-    elif x is None:
-        return None
-    else:
-        assert False, f"Unknown type {type(x)} cannot be broken into tensors."
-@dataclass
-class LLMHookerConfig(Dict):
-    """Config for LLMHook."""
-    module_name: str
-    layer: int = 0
-    retain_output: bool = True
-    output_save_func: Optional[Callable] = None
-    retain_input: bool = False
-    input_save_func: Optional[Callable] = None
-    edit_output: Optional[Callable] = None
-    float: bool = False
-    clone: bool = False
-    detach: bool = True
-    device: str = "cpu"
-    
-class LLMHook:
-    def __init__(self, module, config: LLMHookerConfig):
-        self.module = module
-        self.config = config
-        self.inputs = []
-        self.outputs = []
-        
-        def hook(module, input, output):
-            if config.retain_input:
-                if config.input_save_func is not None:
-                    in_save = config.input_save_func(module, input, output)
-                else:
-                    in_save = recursive_copy(input[0] if isinstance(input, tuple) else input,
-                                             float=float, clone=config.clone, detach=config.detach, device=config.device)
-                self.inputs.append(in_save)
-            if config.retain_output:
-                if config.output_save_func is not None:
-                    out_save = config.output_save_func(module, input, output)
-                else:
-                    out_save = recursive_copy(output[0] if isinstance(output, tuple) else output,
-                                              float=float, clone=config.clone, detach=config.detach, device=config.device)
-                self.outputs.append(out_save)
-            if config.edit_output:
-                output = config.edit_output(module, input, output)
-            return output
-
-        self.hook = module.register_forward_hook(hook)
-
-    def remove(self):
-        self.inputs.clear()
-        self.outputs.clear()
-        self.hook.remove()
-
-    def reset(self):
-        self.inputs.clear()
-        self.outputs.clear()
-
-class LLMHooker:
-    """Context manager that add multiple hooks to LLM."""
-    
-    def __init__(self, mt, config: Union[List[LLMHookerConfig], LLMHookerConfig]):
-        self.mt = mt
-        self.config_list = config if isinstance(config, list) else [config]
-        self.hooks = []
-    
-    def __enter__(self):
-        for config in self.config_list:
-            module = getattr(self.mt, config.module_name)
-            
-            if not module:
-                raise ValueError(f"Module {config.module_name} not found in LLM.")
-            
-            if isinstance(module, list):
-                if config.layer < 0 or config.layer >= len(module):
-                    raise ValueError(f"Module {config.module_name}[{config.layer}] out of range.")
-                module = module[config.layer]
-            
-            if not isinstance(module, torch.nn.Module):
-                raise ValueError(f"Module {config.module_name} is not a torch.nn.Module.")
-            
-            self.hooks.append(LLMHook(module, config))
-        
-        return self
-    
-    def __exit__(self, *args, **kwargs):
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks.clear()
