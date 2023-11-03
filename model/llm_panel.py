@@ -2,7 +2,7 @@ import os
 import time
 import torch
 import ipywidgets as widgets
-from .model_interface import LLM
+from .llm import LLM
 from .llm_utils import BaiduTrans, get_free_gpus
 
 torch.set_float32_matmul_precision('medium')

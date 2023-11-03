@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .model_interface import LLM
+from .llm import LLM
 from .llm_utils import *
 from .llm_panel import *
 from .llm_hooker import *

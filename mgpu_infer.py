@@ -6,7 +6,8 @@ import json
 import random
 from tqdm.auto import tqdm
 import time
-from model.model_interface import LLM
+from model.llm_utils import PaddingSide
+from model.llm import LLM
 
 
 def get_local_rank():
@@ -74,7 +75,8 @@ def multigpu_inference(model, tok, dst, save_path, local_bsz=6,**kwargs):
         
         for batch_labels in batch_labels_list:
             batch_label_length = [len(tok(l, add_special_tokens=False)['input_ids']) for l in batch_labels]
-            batch_label_ids = tok(batch_labels, return_tensors='pt', padding=True, add_special_tokens=False)['input_ids']
+            with PaddingSide(tok, 'right'):
+                batch_label_ids = tok(batch_labels, return_tensors='pt', padding=True, add_special_tokens=False)['input_ids']
             batch_input_ids = torch.cat((last_token_id.repeat(len(batch_labels),1), batch_label_ids), dim=-1)
             batch_past_key_values = [(k.repeat(len(batch_labels),1,1,1), v.repeat(len(batch_labels),1,1,1)) for (k,v) in past_key_values]
             batch_logits = model(input_ids=batch_input_ids.to(model.device), past_key_values=batch_past_key_values)['logits']
@@ -93,7 +95,7 @@ def multigpu_inference(model, tok, dst, save_path, local_bsz=6,**kwargs):
     json.dump(outputs, open(f'{save_path}_{local_rank}.json', 'w'), indent=4)
 
 
-def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=42, **kwargs):
+def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=42, cpu=False,**kwargs):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -127,7 +129,11 @@ def mgpu_infer(model_path, dst_path, save_path="result.json", func="gen", seed=4
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
     
-    model.cuda(local_rank)
+    if cpu:
+        model.float()
+    else:
+        model.cuda(local_rank)
+        
     
     dst = json.load(open(dst_path))
     
