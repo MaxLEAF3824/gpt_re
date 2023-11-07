@@ -99,6 +99,7 @@ for d in tqdm(data):
             
             key_set = set(['检验项', '药品名称', '细菌名称'])
             value_set = set(['异常标识', '结果标识', '结果'])
+            
             value_map = [('^N$','[正常]'),("^敏感[\s\S]*","[敏感]"),("^耐药[\s\S]*","[耐药]"),("^中介[\s\S]*","[中介]"),("^$",'[异常]'),("阴.*性.*","[阴性]"),("阳.*性.*","[阳性]"),("S","[阴性]"),("R","[阳性]"),("T","[中介]")]
             for check in d['checks']:
                 check_time = datetime.strptime(check['info']['报告时间'], "%Y/%m/%d %H:%M")
@@ -108,6 +109,8 @@ for d in tqdm(data):
                     check_dict['values'] = {}
                     key_name = '检验项'
                     value_name = '异常标识'
+                    if not check['values']:
+                        continue
                     for key in key_set:
                         if key in check['values'][0]:
                             key_name = key
@@ -127,7 +130,7 @@ for d in tqdm(data):
                                 value_item = flag
                                 break
                         if not key_item or not value_item:
-                            # print(c)
+                            print(c)
                             continue
                         check_dict[key_item] = value_item
                     related_checks.append(check_dict)
