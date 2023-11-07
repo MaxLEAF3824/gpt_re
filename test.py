@@ -4,7 +4,7 @@ import os
 import pylcs
 from datetime import datetime
 from tqdm.auto import tqdm
-
+import traceback
 
 default_tmp = ('性别', '年龄', '入院时间', '出院时间', '门诊诊断', '入院诊断', '出院诊断', '入院时主要症状及体征', '主要化验结果', '特殊检查及重要会诊', '病程与治疗结果', '合并症', '出院时情况', '出院后建议', '治疗结果', "主治医师")
 tmp_orders = [(0,       1,        2,          3,        4,          5,          6,          7,                  8,              9,              10,             11,         12,          13,         14,         15),
@@ -29,7 +29,12 @@ variants = lambda key :[key] + specaial_variants.get(key, []) + [(k[:i] + "\n" +
 is_checkout = lambda text: all(any(kv in text for kv in variants(key)) for key in default_tmp)
 
 
-data = json.load(open("../my_datasets/ninth/ninth_data.json"))
+
+my_datasets_dir = os.environ['my_datasets_dir']
+input_path = os.path.join(my_datasets_dir,"ninth/ninth_data.json")
+output_path = os.path.join(my_datasets_dir, "ninth/checkout_data_with_checks.json")
+
+data = json.load(open(input_path))
 checkout_data = []
 num_error = 0
 not_checkout = 0
@@ -92,27 +97,50 @@ for d in tqdm(data):
                 time_span.append(datetime.strptime(time_stamp, "%Y %m %d %H %M"))
             # print('time_span: ', time_span)
             
+            key_set = set(['检验项', '药品名称', '细菌名称'])
+            value_set = set(['异常标识', '结果标识', '结果'])
+            value_map = [('^N$','[正常]'),("^敏感[\s\S]*","[敏感]"),("^耐药[\s\S]*","[耐药]"),("^中介[\s\S]*","[中介]"),(r"^$",'[异常]')]
             for check in d['checks']:
                 check_time = datetime.strptime(check['info']['报告时间'], "%Y/%m/%d %H:%M")
                 if time_span[0] < check_time < time_span[1]:
                     check_dict = {}
                     check_dict['header'] = check['info']['标本名称']
                     check_dict['values'] = {}
+                    key_name = '检验项'
+                    value_name = '异常标识'
+                    for key in key_set:
+                        if key in check['values'][0]:
+                            key_name = key
+                            break
+                    for value in value_set:
+                        if value in check['values'][0]:
+                            value_name = value
+                            break
                     for c in check['values']:
-                        if c.get("异常标识"):
-                            check_dict['values'][c['检验项']] = '[正常]' if c["异常标识"] == "N" else '[异常]'
-                        elif c.get("结果标识"):
-                            check_dict['values'][c['药品名称']] = '[正常]' if c["结果标识"] == "Z" else '[异常]'
-                        else:
+                        key_item = c[key_name]
+                        value_item = ''
+                        if not c[value_name]:
+                            continue
+                        
+                        for pattern,flag in value_map:
+                            if re.match(pattern, c[value_name]):
+                                value_item = flag
+                                break
+                        if not key_item or not value_item:
                             print(c)
+                            continue
+                        check_dict[key_item] = value_item
                     related_checks.append(check_dict)
+            if not related_checks:
+                continue
             info_dict['完整化验结果'] = related_checks
             checkout_data.append(info_dict)
         except Exception as e:
-            print(f"ERROR{e}\n{checkout_id}")
+            tb_str = traceback.format_tb(e.__traceback__)
+            print(f"ERROR: {checkout_id} LINE:{tb_str} {e}")
             num_error += 1
         break
 print(f"num error:{num_error}")
 print(f"not_checkout:{not_checkout}")
 print(f"success num :{len(checkout_data)}")
-json.dump(checkout_data, open("../my_datasets/ninth/checkout_data.json",'w'), ensure_ascii=False)
+json.dump(checkout_data, open(output_path,'w'), ensure_ascii=False)

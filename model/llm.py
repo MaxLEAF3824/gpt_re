@@ -5,12 +5,11 @@ import torch.nn as nn
 from copy import deepcopy
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lrs
-from pyecharts import options as opts
-from pyecharts.charts import Bar, Timeline, Tab, Line
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import pytorch_lightning as pl
-from .llm_hooker import *
-from .llm_utils import *
+from .llm_hooker import LLMHooker, LLMHookerConfig
+from .llm_utils import LoadWoInit
 
 class Unembedding(nn.Module):
     def __init__(self, lm_head, ln_f):
@@ -96,8 +95,8 @@ class LLM(pl.LightningModule):
             self.ln_1.append(eval(f"model.{config['ln_1_module_tmp'].format(l)}"))
             self.ln_2.append(eval(f"model.{config['ln_2_module_tmp'].format(l)}"))
           
-    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
+    def forward(self, **kwargs):
+        return self.model(**kwargs)
 
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
         input_ids, attention_mask = batch[0], batch[1]
@@ -215,6 +214,8 @@ class LLM(pl.LightningModule):
         return answer
     
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
+        from pyecharts import options as opts
+        from pyecharts.charts import Bar, Timeline, Tab, Line
         unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
         inp = self.tok(input_text, return_tensors='pt')
         hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]

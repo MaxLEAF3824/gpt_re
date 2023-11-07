@@ -2,6 +2,7 @@ import os
 import time
 import torch
 import ipywidgets as widgets
+from dataclasses import dataclass
 from .llm import LLM
 from .llm_utils import BaiduTrans, get_free_gpus
 
@@ -9,20 +10,23 @@ torch.set_float32_matmul_precision('medium')
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-VICUNA_TEMPLATE = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
-INTERNLM_TEMPLATE = "<|User|>:{}<eoh>\n<|Bot|>:"
+
+
+@dataclass
+class ChatTemplate:
+    VICUNA_TEMPLATE = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n##USER:\n{}\n\n##ASSISTANT:\n"
+    INTERNLM_TEMPLATE = "<|User|>:{}<eoh>\n<|Bot|>:"
 
 class LLMPanel(widgets.VBox):
     def __init__(self, model_list, chat_template=None):
         super(LLMPanel, self).__init__()
         self.translator = BaiduTrans()
         self.free_gpus = get_free_gpus()
-        if not self.free_gpus:
-            self.free_gpus = [0]
-        self.chat_template = chat_template if chat_template else VICUNA_TEMPLATE
+        has_free_gpus = bool(self.free_gpus)
+        self.chat_template = chat_template if chat_template else ChatTemplate.VICUNA_TEMPLATE
         
         # model dropdown
-        self.mt_dropdown = widgets.Dropdown(options=list(model_list.items()), description='Model:', disabled=False,)
+        self.mt_dropdown = widgets.Dropdown(options=list(model_list.items()), description='Model:', disabled=False)
         self.mt = None
         
         # setup button
@@ -30,21 +34,22 @@ class LLMPanel(widgets.VBox):
         self.setup_btn.on_click(self.setup_llm_func)
 
         # switch deivce
-        self.device_tbtn = widgets.ToggleButtons(options=['cpu', f'cuda',], disabled=False,)
+        self.device_tbtn = widgets.ToggleButtons(options=['cpu', f'cuda',], disabled=not has_free_gpus)
         self.device_tbtn.observe(self.switch_device_func, names='value')
 
         # free gpu list
-        self.free_gpus_dropdown = widgets.Dropdown(options=self.free_gpus, description='Free GPUs:', disabled=False,)
+        self.free_gpus_dropdown = widgets.Dropdown(options=self.free_gpus, description='Free GPUs:', disabled=not has_free_gpus)
         
         # switch precision
-        self.precision_tbtn = widgets.ToggleButtons(options=['half', 'float'], disabled=False,)
+        self.precision_tbtn = widgets.ToggleButtons(options=['half', 'float'], disabled=not has_free_gpus)
+        self.precision_tbtn.value = 'float' if not has_free_gpus else 'half'
         self.precision_tbtn.observe(self.switch_precision_func, names='value')
 
         # max new token slider
-        self.mnt_slider = widgets.IntSlider(value=64,min=1,max=2048,step=1,description='new token:',disabled=False,)
+        self.mnt_slider = widgets.IntSlider(value=64,min=1,max=2048,step=1,description='new token:',disabled=False)
         
         # temperature slider
-        self.tem_slider = widgets.FloatSlider(value=1.0,min=0.0,max=10.0,step=0.1,description='temperature:',disabled=False,)
+        self.tem_slider = widgets.FloatSlider(value=1.0,min=0.0,max=10.0,step=0.1,description='temperature:',disabled=False)
         
         # sample checkbox
         self.sample_checkbox = widgets.Checkbox(value=False,description='do sample',disabled=False,)

@@ -14,5 +14,5 @@
 
 from .llm import LLM
 from .llm_utils import *
-from .llm_panel import *
-from .llm_hooker import *
+from .llm_panel import LLMPanel, ChatTemplate
+from .llm_hooker import LLMHookerConfig, LLMHooker, LLMHook
