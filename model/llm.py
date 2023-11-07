@@ -17,11 +17,11 @@ class Unembedding(nn.Module):
         super().__init__()
         self.lm_head = lm_head
         self.ln_f = ln_f
+        self.requires_grad_(False)
         
     def forward(self, x):
-        with torch.no_grad():
-            x = self.ln_f(x)
-            x = self.lm_head(x)
+        x = self.ln_f(x)
+        x = self.lm_head(x)
         return x
 
 class LLM(pl.LightningModule):
@@ -84,7 +84,6 @@ class LLM(pl.LightningModule):
         self.ln_f = eval(f"model.{config['ln_f_module']}")
         self.lm_head = eval(f"model.{config['lm_head_module']}")
         self.embedding = eval(f"model.{config['embedding_module']}")
-        self.unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
         self.block = []
         self.attn = []
         self.mlp = []
@@ -216,7 +215,7 @@ class LLM(pl.LightningModule):
         return answer
     
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
-        self.unembedding.to('cpu')
+        unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
         inp = self.tok(input_text, return_tensors='pt')
         hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
@@ -243,7 +242,7 @@ class LLM(pl.LightningModule):
             seq_len = cur_matrix.shape[2]
             
             # 将activation映射到vocabulary词表空间，计算所有unbedding token的概率
-            cur_logits = self.unembedding(cur_matrix) # [num_modules, n_layer, seq_len, vocab_size]
+            cur_logits = unembedding(cur_matrix) # [num_modules, n_layer, seq_len, vocab_size]
             cur_prob = torch.softmax(cur_logits, dim=-1)  # [num_modules, n_layer, seq_len, vocab_size]
 
             # 计算层信息熵
@@ -252,7 +251,7 @@ class LLM(pl.LightningModule):
             # 计算层概率差
             block_hook0 = [h for h in hooker.hooks if h.config.module_name == 'block' and h.config.layer == 0][0]
             x0 = block_hook0.inputs[0]# [1, seq_len, hidden_size]
-            logits0 = self.unembedding(x0.unsqueeze(0).repeat(num_modules,1,1,1)) # [num_modules, 1, seq_len, vocab_size]
+            logits0 = unembedding(x0.unsqueeze(0).repeat(num_modules,1,1,1)) # [num_modules, 1, seq_len, vocab_size]
             cur_logits_extended = torch.cat([logits0, cur_logits], dim=1) # [num_modules, n_layer+1, seq_len, vocab_size]
             cur_diff = F.cross_entropy(cur_logits_extended[:,:-1].reshape(-1, cur_logits_extended.shape[-1]), cur_prob.reshape(-1, cur_prob.shape[-1]), reduction='none') # [num_modules * n_layer * seq_len]
             cur_diff = cur_diff.reshape(num_modules, self.n_layer, seq_len) # [num_modules, n_layer, seq_len]
