@@ -2,22 +2,24 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
-from model.llm import LLM
-from model.llm_hooker import LLMHooker, LLMHookerConfig
+from .llm import LLM
+from .llm_hooker import LLMHooker, LLMHookerConfig
+import os
 
-
+SPECIAL_TOKENS=['[正常]','[异常]','[敏感]','[耐药]','[中介]','[极弱阳性]','[弱阳性]','[阴性]','[阳性]']
 
 class DictsEncoder(nn.Module):
-    def __init__(self, hidden_size, output_dim, nhead=8, num_layers=6):
+    def __init__(self, hidden_size, output_dim, num_encoder_head, num_encoder_layers):
         super(DictsEncoder, self).__init__()
         self.hidden_size = hidden_size
-        self.nhead = nhead
-        self.tok = AutoTokenizer.from_pretrained('/mnt/petrelfs/guoyiqiu/coding/huggingface/hub/models--bert-base-chinese/snapshots/8d2a91f91cc38c96bb8b4556ba70c392f8d5ee55')
-        self.tok.add_tokens(['[正常]','[异常]','[敏感]','[耐药]','[中介]'])
+        self.nhead = num_encoder_head
+        self.num_encoder_layers = num_encoder_layers
+        self.tok = AutoTokenizer.from_pretrained(os.path.join(os.environ['my_models_dir'], 'bert-base-chinese'))
+        self.tok.add_tokens(SPECIAL_TOKENS)
         self.sep_id = self.tok.convert_tokens_to_ids('[SEP]')
         self.cls_id = self.tok.convert_tokens_to_ids('[CLS]')
         self.embedding = nn.Embedding(len(self.tok), hidden_size)
-        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=nhead), num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_encoder_head), num_layers=num_encoder_layers)
         self.linear = nn.Linear(hidden_size, output_dim)
         
     def prepare_input_ids_and_mask(self, dicts : List[Dict]):
@@ -61,30 +63,30 @@ class DictsEncoder(nn.Module):
         return x
 
 class DictLLM(nn.Module):
-    def __init__(self, mt_path, encoder_hidden_size, num_table_token, **encoder_kwargs):
+    def __init__(self, mt_path, encoder_hidden_size, num_table_token, num_encoder_head, num_encoder_layers):
         super(DictLLM, self).__init__()
         self.num_table_token = num_table_token
         self.encoder_hidden_size = encoder_hidden_size
-        self.mt = LLM.from_pretrained(model_path=mt_path)
-        self.embedding_dim = self.mt.embedding.embedding_dim
-        self.table_token_id = self.mt.tok.unk_token_id
-        self.dicts_encoder = DictsEncoder(hidden_size=encoder_hidden_size, output_dim=self.embedding_dim*num_table_token, **encoder_kwargs)
+        self.llm = LLM.from_pretrained(model_path=mt_path)
+        self.embedding_dim = self.llm.embedding.embedding_dim
+        self.table_token_id = self.llm.tok.unk_token_id
+        self.dicts_encoder = DictsEncoder(encoder_hidden_size, self.embedding_dim*num_table_token, num_encoder_head, num_encoder_layers)
         
     def forward(self, input_text : List[str], dicts : List[List[Dict]], label_text : List[str] = None):
         batch_size = len(input_text)
-        inp = self.mt.tok(input_text, padding=True, return_tensors='pt')
+        inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
         input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
         labels = None
         if label_text:
             input_lens = attention_mask.sum(dim=1)
             all_text = [t1+t2 for t1,t2 in zip(input_text, label_text)]
-            inp = self.mt.tok(all_text, padding=True, return_tensors='pt')
+            inp = self.llm.tok(all_text, padding=True, return_tensors='pt')
             input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
             all_lens = attention_mask.sum(dim=1)
             labels = torch.ones_like(input_ids) * -100
             for i in range(batch_size):
                 labels[i,input_lens[i]:all_lens[i]] = input_ids[i,input_lens[i]:all_lens[i]]
-        text_embedding = self.mt.embedding(input_ids)
+        text_embedding = self.llm.embedding(input_ids)
         dicts_embedding = []
         for ds in dicts:
             dicts_embedding.append(self.dicts_encoder(ds))
@@ -92,13 +94,13 @@ class DictLLM(nn.Module):
         dicts_embedding = dicts_embedding.reshape((batch_size, self.num_table_token, self.embedding_dim))
         td_embedding = torch.cat([text_embedding, dicts_embedding], dim=1)
         td_attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token)), attention_mask],dim=1)
-        model_output = self.mt(inputs_embeds=td_embedding, attention_mask=td_attention_mask, labels=labels)
+        model_output = self.llm(inputs_embeds=td_embedding, attention_mask=td_attention_mask, labels=labels)
         return model_output
 
     def generate(self, input_text: str, dicts:List[Dict], **genkwargs):
         with torch.no_grad():
             dicts_embedding = self.dicts_encoder(dicts).reshape((1, self.num_table_token, self.embedding_dim))
-        input_ids = self.mt.tok(input_text)['input_ids']
+        input_ids = self.llm.tok(input_text)['input_ids']
         table_token_ids = [self.table_token_id for i in range(self.num_table_token)]
         input_ids = table_token_ids + input_ids
         input_ids = torch.tensor(input_ids).reshape(1,-1)
@@ -114,12 +116,10 @@ class DictLLM(nn.Module):
                     output[0,idx:idx+nt,:] = dicts_embedding
             return output
 
-        with LLMHooker(self.mt, LLMHookerConfig("embedding",retain_output=False, edit_output=edit_func)):
-            output = self.mt.model.generate(input_ids=input_ids, attention_mask=attention_mask, **genkwargs)
+        with LLMHooker(self.llm, LLMHookerConfig("embedding",retain_output=False, edit_output=edit_func)):
+            output = self.llm.model.generate(input_ids=input_ids, attention_mask=attention_mask, **genkwargs)
         return output
 
-def train():
-    
 
 if __name__=="__main__":
     import json
@@ -133,6 +133,7 @@ if __name__=="__main__":
         dicts = d['完整化验结果']
         inputs.append({"input_text":text, "dicts":dicts})
     forward_output = dllm(**inputs[0])
+    print('forward_output: ', forward_output)
     generate_output = dllm.generate(**inputs[0])
-    print(forward_output)
+    print('generate_output: ', generate_output)
     
