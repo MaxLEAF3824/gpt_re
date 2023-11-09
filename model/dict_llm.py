@@ -51,12 +51,13 @@ class DictsEncoder(nn.Module):
                 mask[sep_idx,i:j] = False
                 mask[-1, sep_idx] = False
                 mask[sep_idx, -1] = False
+        input_ids = input_ids.to(self.embedding.weight.data.device)
+        mask = mask.to(self.embedding.weight.data.device)
         return input_ids, mask
     
     def forward(self, dicts : List[Dict]):
         input_ids, mask = self.prepare_input_ids_and_mask(dicts)
         x = self.embedding(input_ids).reshape(input_ids.shape[0], self.hidden_size)
-        print('src: ', x.shape)
         x = self.transformer_encoder(src=x, mask=mask)
         x = x[-1,:]
         x = self.linear(x)
@@ -86,15 +87,24 @@ class DictLLM(nn.Module):
             labels = torch.ones_like(input_ids) * -100
             for i in range(batch_size):
                 labels[i,input_lens[i]:all_lens[i]] = input_ids[i,input_lens[i]:all_lens[i]]
+            print('labels: ', labels.shape)
+        input_ids = input_ids.to(self.llm.model.device)
+        
         text_embedding = self.llm.embedding(input_ids)
-        dicts_embedding = []
-        for ds in dicts:
-            dicts_embedding.append(self.dicts_encoder(ds))
-        dicts_embedding = torch.vstack(dicts_embedding)
-        dicts_embedding = dicts_embedding.reshape((batch_size, self.num_table_token, self.embedding_dim))
-        td_embedding = torch.cat([text_embedding, dicts_embedding], dim=1)
-        td_attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token)), attention_mask],dim=1)
-        model_output = self.llm(inputs_embeds=td_embedding, attention_mask=td_attention_mask, labels=labels)
+        dicts_embedding = torch.vstack([self.dicts_encoder(ds) for ds in dicts]).reshape((batch_size, self.num_table_token, self.embedding_dim))
+        
+        input_embeds = torch.cat([text_embedding, dicts_embedding], dim=1)
+        print('input_embeds: ', input_embeds.shape)
+        
+        attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token)), attention_mask], dim=1).to(self.llm.model.device)
+        print('attention_mask: ', attention_mask.shape)
+        
+        if labels is not None:
+            labels = torch.cat([torch.ones((batch_size, self.num_table_token)) * -100, labels],dim=1).to(self.llm.model.device)
+            labels = labels.type(torch.long)
+            print('labels: ', labels.shape)
+        
+        model_output = self.llm(inputs_embeds=input_embeds, attention_mask=attention_mask, labels=labels)
         return model_output
 
     def generate(self, input_text: str, dicts:List[Dict], **genkwargs):

@@ -1,15 +1,10 @@
 import os
-import copy
-from tqdm.auto import tqdm
 from dataclasses import dataclass, field
 import json
 import pathlib
 from typing import Dict, Optional, Sequence, Tuple, Union, List, Any
 import torch.nn.functional as F
-import pdb
 import torch
-import wandb
-from torch.utils.data import Dataset
 import transformers
 from transformers import Trainer
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -24,7 +19,6 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 
 def rank0_print(*args):
@@ -68,6 +62,7 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
+    remove_unused_columns : bool = False
     model_max_length: int = field(default=2048)
     output_dir : str = field(default="output/")
 
@@ -79,8 +74,7 @@ class DictLLMTrainer(Trainer):
 
 @dataclass
 class DictDataCollator(object):
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        print('instances: ', instances)
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, object]:
         input_text = [i['input'] for i in instances]
         dicts = [i['data'] for i in instances]
         label_text = [i['output'] for i in instances]
@@ -93,19 +87,21 @@ def train():
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
     local_rank = training_args.local_rank
     rank0_print(f"model_args: {model_args}\ndata_args: {data_args}")
+    
+    # Load Dataset
+    train_dst = json.load(open(data_args.train_data_path))
+    print('train_dst: ', len(train_dst))
+    eval_dst = json.load(open(data_args.eval_data_path))
+    data_collator = DictDataCollator()
+    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
     dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers)
     dllm.half()
     model, tok = dllm, dllm.llm.tok
-    
-    # Load Dataset
-    train_dst = json.load(open(data_args.train_data_path)) if data_args.train_data_path else None
-    eval_dst = json.load(open(data_args.eval_data_path)) if data_args.eval_data_path else None
-    data_collator = DictDataCollator()
-    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Trainer
     trainer = DictLLMTrainer(model=model, tokenizer=tok, args=training_args, **data_modules)
