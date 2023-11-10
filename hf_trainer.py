@@ -63,7 +63,6 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns : bool = False
-    model_max_length: int = field(default=2048)
     output_dir : str = field(default="output/")
 
 class DictLLMTrainer(Trainer):
@@ -93,14 +92,15 @@ def train():
     
     # Load Dataset
     train_dst = json.load(open(data_args.train_data_path))
-    print('train_dst: ', len(train_dst))
+    rank0_print('train dst size: ', len(train_dst))
+    
     eval_dst = json.load(open(data_args.eval_data_path))
     data_collator = DictDataCollator()
     data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
     dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers)
-    dllm.half()
+    dllm.float()
     model, tok = dllm, dllm.llm.tok
     
     # Load Trainer

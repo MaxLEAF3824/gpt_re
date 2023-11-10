@@ -81,7 +81,7 @@ class LLMPanel(widgets.VBox):
         mt_path = self.mt_dropdown.value
         use_flash_attention_2 = True if "llama" in mt_path or "vicuna" in mt_path else False
         try:
-            self.mt = LLM.from_pretrained(model_path=self.mt_dropdown.value, torch_dtype=torch_dtype, use_flash_attention_2=use_flash_attention_2)
+            self.mt = LLM.from_pretrained(mt_path=self.mt_dropdown.value, torch_dtype=torch_dtype, use_flash_attention_2=use_flash_attention_2)
             self.device_tbtn.value = 'cpu'
             print(f"Everything is ready. Time cost: {time.time() - time_st:.2f}s")
         except Exception as e:

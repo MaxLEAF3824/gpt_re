@@ -4,10 +4,7 @@ import torch
 import torch.nn as nn
 from copy import deepcopy
 import torch.nn.functional as F
-import torch.optim.lr_scheduler as lrs
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import pytorch_lightning as pl
 from .llm_hooker import LLMHooker, LLMHookerConfig
 from .llm_utils import LoadWoInit
 
@@ -23,20 +20,21 @@ class Unembedding(nn.Module):
         x = self.lm_head(x)
         return x
 
-class LLM(pl.LightningModule):
+class LLM(nn.Module):
+
     def __init__(self, **config):
         super().__init__()
-        self.save_hyperparameters()
+        self.config=config
 
     @classmethod
     def from_pretrained(cls, **config):
         self = cls(**config)
-        assert hasattr(self.hparams, "model_path"), "you should specify a model_path when using from pretrained"
-        use_flash_attention_2 = getattr(self.hparams, "use_flash_attention_2", False)
-        torch_dtype = self.hparams.torch_dtype if hasattr(self.hparams, "torch_dtype") else torch.float16
+        mt_path = self.config.get("mt_path", None)
+        use_flash_attention_2 = self.config.get("use_flash_attention_2", False)
+        torch_dtype = self.config.get("torch_dtype", torch.float16)
         with LoadWoInit():
-            self.model = AutoModelForCausalLM.from_pretrained(self.hparams.model_path, trust_remote_code=True, torch_dtype=torch_dtype,use_flash_attention_2=use_flash_attention_2)
-            self.tok = AutoTokenizer.from_pretrained(self.hparams.model_path, trust_remote_code=True, use_fast=True)
+            self.model = AutoModelForCausalLM.from_pretrained(mt_path, trust_remote_code=True, torch_dtype=torch_dtype,use_flash_attention_2=use_flash_attention_2)
+        self.tok = AutoTokenizer.from_pretrained(mt_path, trust_remote_code=True, use_fast=True)
         self.post_init()
         return self
     
@@ -57,17 +55,6 @@ class LLM(pl.LightningModule):
             self.tok.add_special_tokens({"unk_token": "<unk>"})
         if not self.tok.pad_token:
             self.tok.pad_token = self.tok.eos_token
-        # self.tok.padding_side = 'left'
-        
-        # configure loss function
-        if not hasattr(self.hparams, "loss_func"):
-            self.loss_func = F.cross_entropy
-        else:
-            loss_func_name = self.hparams.loss_func.lower()
-            if hasattr(F, loss_func_name):
-                self.loss_func = getattr(F, loss_func_name)
-            else:
-                raise ValueError("illegal loss func")
         
         # configure module config
         model_class_name = self.model.__class__.__name__
@@ -80,6 +67,7 @@ class LLM(pl.LightningModule):
         self.module_config = config
         self.idx2token = [f"{i}-{self.tok.decode(i)}" for i in range(self.tok.vocab_size)]
         self.n_layer = eval(f"model.{config['n_layer']}")
+    
         self.ln_f = eval(f"model.{config['ln_f_module']}")
         self.lm_head = eval(f"model.{config['lm_head_module']}")
         self.embedding = eval(f"model.{config['embedding_module']}")
@@ -97,108 +85,6 @@ class LLM(pl.LightningModule):
           
     def forward(self, **kwargs):
         return self.model(**kwargs)
-
-    def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
-        input_ids, attention_mask = batch[0], batch[1]
-        labels = batch[2] if len(batch) > 2 else None
-        return self(input_ids, attention_mask=attention_mask, labels=labels)
-
-    def training_step(self, batch, batch_idx):
-        '''batch: (input_ids, attention_mask, labels) **padding already** '''
-        input_ids, attention_mask, labels = batch
-        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
-        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
-        labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
-
-        res = self(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-        lm_logits = res['logits']
-        # Shift so that tokens < n predict n
-        shift_logits = lm_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        if isinstance(res.get('loss'), torch.Tensor):
-            loss = res['loss']
-        else:
-            loss = self.loss_func(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-        total_num = torch.argwhere(shift_labels != -100).shape[0]
-        correct_num = torch.sum(pred == shift_labels).item()
-        acc = correct_num / total_num
-
-        self.log('train_loss', loss, on_step=True,
-                 on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log('train_acc', acc, on_step=False,
-                 sync_dist=True, on_epoch=True, prog_bar=True)
-
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        '''batch: (input_ids, attention_mask, labels) **not padding**'''
-        input_ids, attention_mask, labels = batch
-        input_ids = input_ids.unsqueeze(0) if len(input_ids.shape) == 1 else input_ids
-        attention_mask = attention_mask.unsqueeze(0) if len(attention_mask.shape) == 1 else attention_mask
-        labels = labels.unsqueeze(0) if len(labels.shape) == 1 else labels
-
-        res = self(input_ids=input_ids,attention_mask=attention_mask, labels=labels)
-
-        lm_logits = res['logits']
-        # Shift so that tokens < n predict n
-        shift_logits = lm_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        if isinstance(res.get('loss'), torch.Tensor):
-            loss = res['loss']
-        else:
-            loss = self.loss_func(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-        total_num = torch.argwhere(shift_labels != -100).shape[0]
-        correct_num = torch.sum(pred == shift_labels).item()
-        
-        pred = torch.argmax(shift_logits, dim=-1)  # [bsz, seq]
-        total_num = torch.argwhere(shift_labels != -100).shape[0]
-        correct_num = torch.sum(pred == shift_labels).item()
-        acc = correct_num / total_num
-        
-        self.log('val_loss', loss, on_step=False,
-                 on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log('val_acc', acc, on_step=False,
-                 sync_dist=True, on_epoch=True, prog_bar=True)
-
-        return (correct_num, total_num)
-
-    def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
-
-    def configure_optimizers(self):
-        # optimizer
-        lr = self.hparams.lr if hasattr(self.hparams, "lr") else 1e-4
-        weight_decay = self.hparams.weight_decay if hasattr(
-            self.hparams, 'weight_decay') else 1
-        optimizer = torch.optim.AdamW(self.trainer.model.parameters(
-        ), lr=lr, weight_decay=weight_decay, fused=True)
-
-        # scheduler
-        try:
-            lr_lambda = eval(self.hparams.lr_lambda)
-        except:
-            lr_lambda = None
-
-        if lr_lambda is not None:
-            scheduler = lrs.LambdaLR(optimizer, lr_lambda=lr_lambda)
-            return [optimizer], [scheduler]
-        elif lr_lambda == "cosine":
-            warmup_t0 = self.hparams.warmup_t0 if hasattr(
-                self.hparams, 'warmup_t0') else 10
-            scheduler = lrs.CosineAnnealingWarmRestarts(
-                optimizer, T_0=warmup_t0)
-            return [optimizer], [scheduler]
-        else:
-            return optimizer
 
     def generate(self, input_texts, cut_input=False, **generate_kwargs):
         inp = self.tok(input_texts, padding=True, return_tensors='pt')
@@ -262,7 +148,7 @@ class LLM(pl.LightningModule):
             cur_uprobs = [] # [seq_len, num_modules, n_layer, vocab_size]
             for j in range(seq_len):
                 cur_token_prob = cur_prob[:,:,j,:] # [num_modules, n_layer, vocab_size]
-                # 计算token在num_modules个模块中的概率变化之和，【这一行是代码的速度瓶颈】
+                # 计算token在num_modules个模块中的概率变化之和，【这一行是速度瓶颈】
                 cur_token_prob_diff = (cur_token_prob[1:] - cur_token_prob[:-1]).abs().sum(dim=0).sum(dim=0) # [vocab_size]
                 # 按照变化之和从大到小排序
                 cur_token_udiff, cur_token_uids = torch.topk(cur_token_prob_diff, k=utokens_num)

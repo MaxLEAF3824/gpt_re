@@ -1,7 +1,7 @@
 from typing import Dict, List
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from .llm import LLM
 from .llm_hooker import LLMHooker, LLMHookerConfig
 import os
@@ -19,7 +19,7 @@ class DictsEncoder(nn.Module):
         self.sep_id = self.tok.convert_tokens_to_ids('[SEP]')
         self.cls_id = self.tok.convert_tokens_to_ids('[CLS]')
         self.embedding = nn.Embedding(len(self.tok), hidden_size)
-        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_encoder_head), num_layers=num_encoder_layers)
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_encoder_head, batch_first=True), num_layers=num_encoder_layers)
         self.linear = nn.Linear(hidden_size, output_dim)
         
     def prepare_input_ids_and_mask(self, dicts : List[Dict]):
@@ -68,7 +68,7 @@ class DictLLM(nn.Module):
         super(DictLLM, self).__init__()
         self.num_table_token = num_table_token
         self.encoder_hidden_size = encoder_hidden_size
-        self.llm = LLM.from_pretrained(model_path=mt_path)
+        self.llm = LLM.from_pretrained(mt_path=mt_path)
         self.embedding_dim = self.llm.embedding.embedding_dim
         self.table_token_id = self.llm.tok.unk_token_id
         self.dicts_encoder = DictsEncoder(encoder_hidden_size, self.embedding_dim*num_table_token, num_encoder_head, num_encoder_layers)
@@ -76,35 +76,34 @@ class DictLLM(nn.Module):
     def forward(self, input_text : List[str], dicts : List[List[Dict]], label_text : List[str] = None):
         batch_size = len(input_text)
         inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
-        input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
-        labels = None
-        if label_text:
+        input_ids, attention_mask, labels = inp['input_ids'], inp['attention_mask'], None
+        
+        if label_text is not None:
+            label_text = [t + f" {self.llm.tok.eos_token}" for t in label_text]
             input_lens = attention_mask.sum(dim=1)
-            all_text = [t1+t2 for t1,t2 in zip(input_text, label_text)]
+            all_text = [t1 + t2 for t1, t2 in zip(input_text, label_text)]
             inp = self.llm.tok(all_text, padding=True, return_tensors='pt')
             input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
             all_lens = attention_mask.sum(dim=1)
             labels = torch.ones_like(input_ids) * -100
             for i in range(batch_size):
                 labels[i,input_lens[i]:all_lens[i]] = input_ids[i,input_lens[i]:all_lens[i]]
-            print('labels: ', labels.shape)
+
+        print(f"input_ids: {input_ids.shape}")
         input_ids = input_ids.to(self.llm.model.device)
-        
         text_embedding = self.llm.embedding(input_ids)
+        inputs_embeds = text_embedding
         dicts_embedding = torch.vstack([self.dicts_encoder(ds) for ds in dicts]).reshape((batch_size, self.num_table_token, self.embedding_dim))
-        
-        input_embeds = torch.cat([text_embedding, dicts_embedding], dim=1)
-        print('input_embeds: ', input_embeds.shape)
-        
-        attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token)), attention_mask], dim=1).to(self.llm.model.device)
-        print('attention_mask: ', attention_mask.shape)
-        
+        inputs_embeds = torch.cat([text_embedding, dicts_embedding], dim=1)
+        attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token),dtype=torch.long), attention_mask], dim=1)
         if labels is not None:
-            labels = torch.cat([torch.ones((batch_size, self.num_table_token)) * -100, labels],dim=1).to(self.llm.model.device)
-            labels = labels.type(torch.long)
-            print('labels: ', labels.shape)
+            labels = torch.cat([torch.ones((batch_size, self.num_table_token),dtype=torch.long) * -100, labels],dim=1).type(torch.long)
+            
+        attention_mask = attention_mask.to(self.llm.model.device)
+        if labels is not None:
+            labels = labels.to(self.llm.model.device)
         
-        model_output = self.llm(inputs_embeds=input_embeds, attention_mask=attention_mask, labels=labels)
+        model_output = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
         return model_output
 
     def generate(self, input_text: str, dicts:List[Dict], **genkwargs):
@@ -129,21 +128,3 @@ class DictLLM(nn.Module):
         with LLMHooker(self.llm, LLMHookerConfig("embedding",retain_output=False, edit_output=edit_func)):
             output = self.llm.model.generate(input_ids=input_ids, attention_mask=attention_mask, **genkwargs)
         return output
-
-
-if __name__=="__main__":
-    import json
-    dst = json.load(open("/mnt/petrelfs/guoyiqiu/coding/my_datasets/ninth/checkout_data_sample.json"))
-    print('dst: ', len(dst))
-    dllm = DictLLM(mt_path="/mnt/petrelfs/guoyiqiu/coding/my_models/gpt2", encoder_hidden_size=128,num_table_token=5)
-    dllm.float()
-    inputs = []
-    for d in dst:
-        text = "Hello! How can I help you?"
-        dicts = d['完整化验结果']
-        inputs.append({"input_text":text, "dicts":dicts})
-    forward_output = dllm(**inputs[0])
-    print('forward_output: ', forward_output)
-    generate_output = dllm.generate(**inputs[0])
-    print('generate_output: ', generate_output)
-    
