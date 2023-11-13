@@ -6,7 +6,7 @@ from typing import Dict, Optional, Sequence, Tuple, Union, List, Any
 import torch.nn.functional as F
 import torch
 import transformers
-from transformers import Trainer
+from transformers import Trainer, TrainingArguments
 from torch.distributed.elastic.multiprocessing.errors import record
 import torch.nn as nn
 import numpy as np
@@ -20,14 +20,14 @@ torch.cuda.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
 
+flag = True
 
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
 
 
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
-                                   output_dir: str):
+def safe_save_model_for_hf_trainer(trainer: Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
     state_dict = trainer.model.state_dict()
     if trainer.args.should_save:
@@ -49,9 +49,10 @@ def load_hf_model_tok(mt_path):
 class ModelArguments:
     mt_path: str = field(default=None)
     encoder_hidden_size : int = field(default=768)
-    num_table_token : int = field(default=10)
+    num_table_token : int = field(default=5)
     num_encoder_head : int = field(default=8)
     num_encoder_layers : int = field(default=12)
+    max_length : int = field(default=2048)
 
 @dataclass
 class DataArguments:
@@ -60,17 +61,13 @@ class DataArguments:
 
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
+class TrainingArguments(TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns : bool = False
     output_dir : str = field(default="output/")
 
-class DictLLMTrainer(Trainer):
-    def compute_loss(self, dllm, inputs, return_outputs=False): 
-        outputs = dllm(**inputs)
-        loss = outputs['loss']
-        return (loss, outputs) if return_outputs else loss
 
+    
 @dataclass
 class DictDataCollator(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, object]:
@@ -78,6 +75,37 @@ class DictDataCollator(object):
         dicts = [i['data'] for i in instances]
         label_text = [i['output'] for i in instances]
         return dict(input_text=input_text, dicts=dicts, label_text=label_text)
+
+
+class DictLLMTrainer(Trainer):
+    def compute_loss(self, dllm, inputs, return_outputs=False): 
+        outputs = dllm(**inputs, output_attentions=True)
+        loss = outputs['loss']
+        return (loss, outputs) if return_outputs else loss
+    
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        
+        label_text = inputs.get("label_text")
+        labels_length = len(model.llm.tok(label_text)['input_ids'])
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+            output_text = model.generate(**inputs, max_new_tokens=2*labels_length)
+            loss = loss.mean().detach()
+
+        return (loss, output_text, label_text)
+
+    def compute_metrics(self, EvalPrediction):
+        print(EvalPrediction.predictions)
+        print(EvalPrediction.label_ids)
+        assert False
+
 
 
 @record
@@ -99,7 +127,7 @@ def train():
     data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
-    dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers)
+    dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers, max_length=model_args.max_length)
     dllm.float()
     model, tok = dllm, dllm.llm.tok
     
