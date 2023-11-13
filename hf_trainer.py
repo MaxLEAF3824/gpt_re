@@ -105,13 +105,13 @@ class DictLLMTrainer(Trainer):
             with self.compute_loss_context_manager():
                 loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
                 loss = loss.mean().detach()
-            # output_text = model.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1])
-            # print('output_text: ', output_text)
-            # output_ids = model.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
-            # print('output_ids: ', output_ids)
+            output_text = model.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1])
+            print('output_text: ', output_text)
+            output_ids = model.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
+            print('output_ids: ', output_ids)
         
-        return (loss, outputs['logits'], labels)
-        # return (loss, output_ids, labels)
+        # return (loss, outputs['logits'], labels)
+        return (loss, output_ids, labels)
 
     def compute_metrics(self, EvalPrediction):
         print(EvalPrediction.predictions)
