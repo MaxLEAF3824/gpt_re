@@ -16,13 +16,15 @@ from copy import deepcopy
 import logging
 import pynvml
 
-def multithread_query_chatgpt(inputs: List[Dict], thread_num=1, max_round=10, temperature=1.0, **kwargs):
+
+
+def multithread_query_chatgpt(inputs: List[Dict], thread_num=1, max_round=10, model_name="gpt-3.5-turbo-1106", temperature=1.0, **kwargs):
     all_answers = []
     round = 1
-    while len(inputs) > 0 or round > max_round:
+    while len(inputs) > 0 and round < max_round:
         def get_output(input):
             query_config = dict(
-                model="gpt-3.5-turbo",
+                model=model_name,
                 messages=[{"role": "user", "content": input}],
                 temperature=temperature,
                 **kwargs
