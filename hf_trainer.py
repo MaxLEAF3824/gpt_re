@@ -71,9 +71,15 @@ class TrainingArguments(TrainingArguments):
 @dataclass
 class DictDataCollator(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, object]:
-        input_text = [i['input'] for i in instances]
-        dicts = [i['data'] for i in instances]
-        label_text = [i['output'] for i in instances]
+        input_text = []
+        dicts = []
+        label_text = []
+        for i in instances:
+            input_text.append(i['input'])
+            if 'data' in i:
+                dicts.append(i['data'])
+            if 'output' in i:
+                label_text.append(i['output'])
         return dict(input_text=input_text, dicts=dicts, label_text=label_text)
 
 
@@ -91,22 +97,31 @@ class DictLLMTrainer(Trainer):
         ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         
-        label_text = inputs.get("label_text")
-        labels_length = len(model.llm.tok(label_text)['input_ids'])
+        input_text = inputs["input_text"]
+        print('input_text: ', input_text)
+        label_text = inputs["label_text"]
+        print('label_text: ', label_text)
+        labels = model.llm.tok(label_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
+        print('labels: ', labels)
+        
         with torch.no_grad():
             with self.compute_loss_context_manager():
                 loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
-            output_text = model.generate(**inputs, max_new_tokens=2*labels_length)
-            loss = loss.mean().detach()
-
-        return (loss, output_text, label_text)
+                loss = loss.mean().detach()
+            output_text = model.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1])
+            print('output_text: ', output_text)
+            output_ids = model.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
+            print('output_ids: ', output_ids)
+        
+        # return (loss, outputs['logits'], labels)
+        return (loss, output_ids, labels)
 
     def compute_metrics(self, EvalPrediction):
         print(EvalPrediction.predictions)
         print(EvalPrediction.label_ids)
         assert False
 
-
+    
 
 @record
 def train():
@@ -120,15 +135,16 @@ def train():
     
     # Load Dataset
     train_dst = json.load(open(data_args.train_data_path))
-    rank0_print('train dst size: ', len(train_dst))
+    rank0_print('train_dst size: ', len(train_dst))
     
     eval_dst = json.load(open(data_args.eval_data_path))
+    rank0_print('eval_dst size: ', len(eval_dst))
+    
     data_collator = DictDataCollator()
     data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
     dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers, max_length=model_args.max_length)
-    dllm.float()
     model, tok = dllm, dllm.llm.tok
     
     # Load Trainer

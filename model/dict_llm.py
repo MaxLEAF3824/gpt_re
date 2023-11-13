@@ -81,10 +81,10 @@ class DictLLM(nn.Module):
         self.num_table_token = num_table_token
         self.encoder_hidden_size = encoder_hidden_size
         self.max_length = max_length
-        self.llm = LLM.from_pretrained(mt_path=mt_path)
+        self.llm = LLM.from_pretrained(mt_path=mt_path).float()
         self.embedding_dim = self.llm.embedding.embedding_dim
         self.dicts_encoder = DictsEncoder(encoder_hidden_size, self.embedding_dim*num_table_token, num_encoder_head, num_encoder_layers)
-        
+
     def forward(self, input_text : List[str], dicts : List[List[Dict]] = None, label_text : List[str] = None, **kwargs):
         batch_size = len(input_text)
         inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
@@ -112,17 +112,17 @@ class DictLLM(nn.Module):
             if labels is not None:
                 labels = torch.cat([torch.ones((batch_size, self.num_table_token),dtype=torch.long) * -100, labels],dim=1).type(torch.long)
              
-        input_embeds = inputs_embeds[:, :self.max_length, :]
+        inputs_embeds = inputs_embeds[:, :self.max_length, :]
         attention_mask = attention_mask[:, :self.max_length].to(self.llm.model.device)
         if labels is not None:
-            labels = labels[:, :self.max_length, :]
+            labels = labels[:, :self.max_length]
         
         model_output = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
         return model_output
 
-    def generate(self, input_text: str, dicts:List[Dict], **genkwargs):
+    def generate(self, input_text: List[str], dicts:List[List[Dict]] = None, label_text: List[str] = None, **genkwargs):
         if not dicts:
-            return self.llm.generate(input_text, **genkwargs)[0]
+            return self.llm.generate(input_text, **genkwargs)
         
         with torch.no_grad():
             dicts_embedding = self.dicts_encoder(dicts).reshape((1, self.num_table_token, self.embedding_dim))
@@ -141,4 +141,5 @@ class DictLLM(nn.Module):
             return output
 
         with LLMHooker(self.llm, LLMHookerConfig("embedding",retain_output=False, edit_output=edit_func)):
-            return self.llm.generate(input_text=input_text, **genkwargs)[0]
+            return self.llm.generate(input_text=input_text, **genkwargs)
+

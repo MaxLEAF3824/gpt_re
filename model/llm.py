@@ -88,16 +88,14 @@ class LLM(nn.Module):
 
     def generate(self, input_texts, cut_input=False, **generate_kwargs):
         inp = self.tok(input_texts, padding=True, return_tensors='pt')
-        input_ids, attention_mask = inp.input_ids, inp.attention_mask
-        if 'max_new_tokens' not in generate_kwargs:
-            generate_kwargs['max_new_tokens'] = 20
+        input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
         input_ids = input_ids.to(self.model.device)
         attention_mask = attention_mask.to(self.model.device)
         output_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         if cut_input:
             output_ids = output_ids[:, input_ids.shape[-1]:]
-        answer = self.tok.batch_decode(output_ids)
-        return answer
+        output_text = self.tok.batch_decode(output_ids)
+        return output_text
     
     def vis_sentence(self, input_text, show_modules=['block','attn','mlp'], utokens_num=20, show_diff=True, **gen_wargs):
         from pyecharts import options as opts
