@@ -14,6 +14,7 @@ import random
 import torch
 from model.llm_utils import LoadWoInit
 from model.dict_llm import DictLLM
+import evaluate
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
@@ -65,8 +66,6 @@ class TrainingArguments(TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns : bool = False
     output_dir : str = field(default="output/")
-
-
     
 @dataclass
 class DictDataCollator(object):
@@ -91,7 +90,7 @@ class DictLLMTrainer(Trainer):
     
     def prediction_step(
         self,
-        model: nn.Module,
+        dllm: nn.Module,
         inputs: Dict[str, Union[torch.Tensor, Any]],
         prediction_loss_only: bool,
         ignore_keys: Optional[List[str]] = None,
@@ -99,26 +98,18 @@ class DictLLMTrainer(Trainer):
         
         input_text = inputs["input_text"]
         label_text = inputs["label_text"]
-        labels = model.llm.tok(label_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
+        labels = dllm.llm.tok(label_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(dllm.llm.model.device)
         
         with torch.no_grad():
             with self.compute_loss_context_manager():
-                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                loss, outputs = self.compute_loss(dllm, inputs, return_outputs=True)
                 loss = loss.mean().detach()
-            output_text = model.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1])
-            print('output_text: ', output_text)
-            output_ids = model.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(model.llm.model.device)
-            print('output_ids: ', output_ids)
+                output_text = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1],synced_gpus=True)
+                # print('output_text: ', output_text)
+                output_ids = dllm.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(dllm.llm.model.device)
         
-        # return (loss, outputs['logits'], labels)
         return (loss, output_ids, labels)
 
-    def compute_metrics(self, EvalPrediction):
-        print(EvalPrediction.predictions)
-        print(EvalPrediction.label_ids)
-        assert False
-
-    
 
 @record
 def train():
@@ -138,14 +129,30 @@ def train():
     rank0_print('eval_dst size: ', len(eval_dst))
     
     data_collator = DictDataCollator()
-    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
+    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator, )
     
     # Load Model
     dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers, max_length=model_args.max_length)
     model, tok = dllm, dllm.llm.tok
     
+    # compute_metrics
+    def compute_metrics(EvalPrediction):
+        output_ids = EvalPrediction.predictions
+        output_ids = output_ids.tolist()
+        output_ids = [[i for i in ids if i != -100] for ids in output_ids]
+        label_ids = EvalPrediction.label_ids
+        label_ids = label_ids.tolist()
+        label_ids = [[i for i in ids if i != -100] for ids in label_ids]
+        predictions = tok.batch_decode(output_ids, skip_special_tokens=True)
+        references = tok.batch_decode(label_ids, skip_special_tokens=True)
+        for pred,ref in zip(predictions, references):
+            rank0_print(f'ref: {ref} pred: {pred}')
+        rouge = evaluate.load("rouge")
+        result = rouge.compute(predictions=predictions,references=references)
+        return {'rougeL':result['rougeL']}
+    
     # Load Trainer
-    trainer = DictLLMTrainer(model=model, tokenizer=tok, args=training_args, **data_modules)
+    trainer = DictLLMTrainer(model=model, tokenizer=tok, args=training_args, **data_modules, compute_metrics=compute_metrics)
     
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

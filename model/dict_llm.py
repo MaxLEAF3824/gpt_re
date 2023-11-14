@@ -102,7 +102,7 @@ class DictLLM(nn.Module):
                 labels[i,input_lens[i]:all_lens[i]] = input_ids[i,input_lens[i]:all_lens[i]]
 
         
-        input_ids = input_ids[:, :self.max_length].to(self.llm.model.device)
+        input_ids = input_ids[:, max(0,input_ids.shape[-1] - self.max_length):].to(self.llm.model.device)
         inputs_embeds = self.llm.embedding(input_ids)
         
         if dicts:
@@ -112,10 +112,10 @@ class DictLLM(nn.Module):
             if labels is not None:
                 labels = torch.cat([torch.ones((batch_size, self.num_table_token),dtype=torch.long) * -100, labels],dim=1).type(torch.long)
              
-        inputs_embeds = inputs_embeds[:, :self.max_length, :]
-        attention_mask = attention_mask[:, :self.max_length].to(self.llm.model.device)
+        inputs_embeds = inputs_embeds[:, max(0,input_ids.shape[-1] - self.max_length):, :]
+        attention_mask = attention_mask[:, max(0,input_ids.shape[-1] - self.max_length):].to(self.llm.model.device)
         if labels is not None:
-            labels = labels[:, :self.max_length]
+            labels = labels[:, max(0,input_ids.shape[-1] - self.max_length):]
         
         model_output = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
         return model_output
