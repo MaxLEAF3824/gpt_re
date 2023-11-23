@@ -3,9 +3,19 @@ from typing import Union, List, Callable, Optional, Dict
 from dataclasses import dataclass
 
 
+def default_input_save_func(module, input_args, input_kwargs, output):
+    if isinstance(input_args, tuple):
+        return input_args[0]
+    return input_args
+
+def default_output_save_func(module, input_args, input_kwargs, output):
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
 def recursive_copy(x, float, clone, detach, device):
     if isinstance(x, torch.Tensor):
-        x = x.to(device)
+        x = x.to(device) if device else x
         x = x.detach() if detach else x
         x = x.clone() if clone else x
         x = x.float() if float else x
@@ -18,17 +28,15 @@ def recursive_copy(x, float, clone, detach, device):
     elif x is None:
         return None
     else:
-        assert False, f"Unknown type {type(x)} cannot be broken into tensors."
+        raise ValueError(f"Unknown type {type(x)} cannot be broken into tensors.")
 
 @dataclass
 class LLMHookerConfig(Dict):
-    """Config for LLMHook."""
+    """Config for LLMHooker."""
     module_name: str
     layer: int = 0
-    retain_output: bool = True
-    output_save_func: Optional[Callable] = None
-    retain_input: bool = False
-    input_save_func: Optional[Callable] = None
+    save_output: Union[bool,Callable] = True
+    save_input: Union[bool,Callable] = False
     edit_output: Optional[Callable] = None
     float: bool = False
     clone: bool = False
@@ -42,26 +50,24 @@ class LLMHook:
         self.inputs = []
         self.outputs = []
         
-        def hook(module, input, output):
-            if config.retain_input:
-                if config.input_save_func is not None:
-                    in_save = config.input_save_func(module, input, output)
-                else:
-                    in_save = recursive_copy(input[0] if isinstance(input, tuple) else input,
-                                             float=float, clone=config.clone, detach=config.detach, device=config.device)
+        def hook(module, input_args, input_kwargs, output):
+            if config.save_input:
+                if isinstance(config.save_input, bool):
+                    config.save_input = default_input_save_func
+                in_save = config.save_input(module, input_args, input_kwargs, output)
+                in_save = recursive_copy(in_save, float=float, clone=config.clone, detach=config.detach, device=config.device)
                 self.inputs.append(in_save)
-            if config.retain_output:
-                if config.output_save_func is not None:
-                    out_save = config.output_save_func(module, input, output)
-                else:
-                    out_save = recursive_copy(output[0] if isinstance(output, tuple) else output,
-                                              float=float, clone=config.clone, detach=config.detach, device=config.device)
+            if config.save_output:
+                if isinstance(config.save_output, bool):
+                    config.save_output = default_output_save_func
+                out_save = config.save_output(module, input_args, input_kwargs, output)
+                out_save = recursive_copy(out_save, float=float, clone=config.clone, detach=config.detach, device=config.device)
                 self.outputs.append(out_save)
             if config.edit_output:
-                output = config.edit_output(module, input, output)
+                output = config.edit_output(module, input_args, input_kwargs, output)
             return output
 
-        self.hook = module.register_forward_hook(hook)
+        self.hook = module.register_forward_hook(hook, with_kwargs=True)
 
     def remove(self):
         self.inputs.clear()

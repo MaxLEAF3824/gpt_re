@@ -14,14 +14,16 @@ import random
 import torch
 from model.llm_utils import LoadWoInit
 from model.dict_llm import DictLLM
-import evaluate
+from rouge_chinese import Rouge
+import jieba
+import time
+
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
 
-flag = True
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -30,6 +32,7 @@ def rank0_print(*args):
 
 def safe_save_model_for_hf_trainer(trainer: Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
+    trainer.save_state()
     state_dict = trainer.model.state_dict()
     if trainer.args.should_save:
         cpu_state_dict = {
@@ -40,7 +43,7 @@ def safe_save_model_for_hf_trainer(trainer: Trainer, output_dir: str):
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
 def load_hf_model_tok(mt_path):
-    tok = transformers.Autotok.from_pretrained(mt_path, trust_remote_code=True)
+    tok = transformers.AutoTokenizer.from_pretrained(mt_path, trust_remote_code=True)
     with LoadWoInit():
         model = transformers.AutoModelForCausalLM.from_pretrained(mt_path, trust_remote_code=True)
     return model, tok
@@ -53,7 +56,9 @@ class ModelArguments:
     num_table_token : int = field(default=5)
     num_encoder_head : int = field(default=8)
     num_encoder_layers : int = field(default=12)
-    max_length : int = field(default=2048)
+    max_length : int = field(default=1600)
+    special_tokens_path : str = field(default=None)
+    no_mask : bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -83,10 +88,9 @@ class DictDataCollator(object):
 
 
 class DictLLMTrainer(Trainer):
-    def compute_loss(self, dllm, inputs, return_outputs=False): 
-        outputs = dllm(**inputs, output_attentions=True)
-        loss = outputs['loss']
-        return (loss, outputs) if return_outputs else loss
+    def compute_loss(self, dllm, inputs, return_outputs=False, **kwargs): 
+        outputs = dllm(**inputs, **kwargs)
+        return (outputs['loss'], outputs) if return_outputs else outputs['loss']
     
     def prediction_step(
         self,
@@ -96,17 +100,18 @@ class DictLLMTrainer(Trainer):
         ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         
-        input_text = inputs["input_text"]
-        label_text = inputs["label_text"]
-        labels = dllm.llm.tok(label_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(dllm.llm.model.device)
+        labels = dllm.llm.tok(inputs["label_text"], padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(dllm.llm.model.device)
         
         with torch.no_grad():
             with self.compute_loss_context_manager():
-                loss, outputs = self.compute_loss(dllm, inputs, return_outputs=True)
+                loss, outputs = self.compute_loss(dllm, inputs, return_outputs=True, output_attentions=True)
                 loss = loss.mean().detach()
-                output_text = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1],synced_gpus=True)
-                # print('output_text: ', output_text)
-                output_ids = dllm.llm.tok(output_text, padding=True, return_tensors='pt', add_special_tokens=False)['input_ids'].to(dllm.llm.model.device)
+                output_ids = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1], synced_gpus=True).to(dllm.llm.model.device)
+        
+        # attn_weights = torch.vstack(list(outputs['attentions'])) # [layers, bsz, num_heads, q_len, kv_seq_len]
+        # attn_weights = torch.mean(attn_weights, dim=(0,1,2)) # [q_len, kv_seq_len]
+        # table_average_weight = attn_weights[dllm.num_table_token:,:dllm.num_table_token].sum(1).mean().item() # [text_len]
+        # self.log({"table_average_weight":table_average_weight})
         
         return (loss, output_ids, labels)
 
@@ -117,7 +122,7 @@ def train():
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
+
     local_rank = training_args.local_rank
     rank0_print(f"model_args: {model_args}\ndata_args: {data_args}")
     
@@ -129,10 +134,19 @@ def train():
     rank0_print('eval_dst size: ', len(eval_dst))
     
     data_collator = DictDataCollator()
-    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator, )
+    data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
-    dllm = DictLLM(model_args.mt_path, model_args.encoder_hidden_size, model_args.num_table_token, model_args.num_encoder_head, model_args.num_encoder_layers, max_length=model_args.max_length)
+    dllm = DictLLM(
+        model_args.mt_path, 
+        model_args.encoder_hidden_size, 
+        model_args.num_table_token, 
+        model_args.num_encoder_head, 
+        model_args.num_encoder_layers, 
+        model_args.max_length, 
+        model_args.special_tokens_path, 
+        model_args.no_mask
+    )
     model, tok = dllm, dllm.llm.tok
     
     # compute_metrics
@@ -140,16 +154,25 @@ def train():
         output_ids = EvalPrediction.predictions
         output_ids = output_ids.tolist()
         output_ids = [[i for i in ids if i != -100] for ids in output_ids]
+        predictions = tok.batch_decode(output_ids, skip_special_tokens=True)
+        predictions = [' '.join(jieba.cut(p)) for p in predictions]
+        
         label_ids = EvalPrediction.label_ids
         label_ids = label_ids.tolist()
         label_ids = [[i for i in ids if i != -100] for ids in label_ids]
-        predictions = tok.batch_decode(output_ids, skip_special_tokens=True)
         references = tok.batch_decode(label_ids, skip_special_tokens=True)
-        for pred,ref in zip(predictions, references):
-            rank0_print(f'ref: {ref} pred: {pred}')
-        rouge = evaluate.load("rouge")
-        result = rouge.compute(predictions=predictions,references=references)
-        return {'rougeL':result['rougeL']}
+        references = [' '.join(jieba.cut(r)) for r in references]
+
+        rouge = Rouge()
+        scores = rouge.get_scores(predictions, references)
+        rougel_f1 = sum([s['rouge-l']['f'] for s in scores])/len(scores)
+        rougel_p = sum([s['rouge-l']['p'] for s in scores])/len(scores)
+        rougel_r = sum([s['rouge-l']['r'] for s in scores])/len(scores)
+        
+        for pred,ref,score in zip(predictions, references, scores):
+            rank0_print(f"ref: {ref} pred: {pred} rougeL-f1: {score['rouge-l']['f']}")
+        
+        return {'rougeL' : rougel_f1, 'rougeL-p' : rougel_p, 'rougeL-r':rougel_r}
     
     # Load Trainer
     trainer = DictLLMTrainer(model=model, tokenizer=tok, args=training_args, **data_modules, compute_metrics=compute_metrics)
@@ -158,8 +181,6 @@ def train():
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-    
-    trainer.save_state()
     
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 

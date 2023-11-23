@@ -18,14 +18,16 @@ import pynvml
 
 
 
-def multithread_query_chatgpt(inputs: List[Dict], thread_num=1, max_round=10, model_name="gpt-3.5-turbo-1106", temperature=1.0, **kwargs):
+def multithread_query_chatgpt(queries: List[Dict], thread_num=1, max_round=10, model_name="gpt-3.5-turbo-1106", temperature=0.0, **kwargs):
     all_answers = []
     round = 1
-    while len(inputs) > 0 and round < max_round:
-        def get_output(input):
+    for idx,i in enumerate(queries):
+        i['query_index'] = idx
+    while len(queries) > 0 and round < max_round:
+        def get_output(query_input):
             query_config = dict(
                 model=model_name,
-                messages=[{"role": "user", "content": input}],
+                messages=[{"role": "user", "content": query_input}],
                 temperature=temperature,
                 **kwargs
             )
@@ -34,21 +36,23 @@ def multithread_query_chatgpt(inputs: List[Dict], thread_num=1, max_round=10, mo
         chatgpt_answers = []
         error_inputs = []
         with concurrent.futures.ThreadPoolExecutor(thread_num) as executor:
-            future_to_input = {executor.submit(get_output, i['query_input']): i for i in inputs}
-            for future in tqdm(concurrent.futures.as_completed(future_to_input),total=len(inputs)):
-                input = future_to_input[future]
+            future_to_input = {executor.submit(get_output, query['query_input']): query for query in queries}
+            for future in tqdm(concurrent.futures.as_completed(future_to_input), total=len(queries)):
+                query = future_to_input[future]
                 try:
                     query_output = future.result()
-                    new_input = deepcopy(input)
-                    new_input['query_output'] = query_output
-                    chatgpt_answers.append(new_input)
+                    query['query_output'] = query_output
+                    chatgpt_answers.append(query)
                 except Exception as exc:
-                    error_inputs.append(input)
-                    logging.info(f'An exception occurred: {exc}')
+                    error_inputs.append(query)
+                    print(f'An exception occurred: {exc}')
         logging.info(f"round: {round} error_inputs: {len(error_inputs)}")
         all_answers.extend(chatgpt_answers)
-        inputs = error_inputs
+        queries = error_inputs
         round += 1
+    all_answers = sorted(all_answers, key=lambda x: x['query_index'])
+    for a in all_answers:
+        del a['query_index']
     return all_answers
 
 def print_struct(data):

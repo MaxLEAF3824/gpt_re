@@ -102,7 +102,7 @@ class LLM(nn.Module):
         from pyecharts.charts import Bar, Timeline, Tab, Line
         unembedding = Unembedding(deepcopy(self.lm_head).to('cpu').float(), deepcopy(self.ln_f).to('cpu').float())
         inp = self.tok(input_text, return_tensors='pt')
-        hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, retain_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
+        hook_configs = [LLMHookerConfig(module_name=m,layer=l, float=True, detach=True, save_input=(l == 0 and m == 'block')) for l in range(self.n_layer) for m in show_modules]
         num_modules = len(show_modules)
         with torch.no_grad(), LLMHooker(self, hook_configs) as hooker:
             gen_wargs['max_new_tokens'] = 1 if 'max_new_tokens' not in gen_wargs else gen_wargs['max_new_tokens']
@@ -111,7 +111,7 @@ class LLM(nn.Module):
             # 模型会在generate的过程中多次forward产生多个hook中间值，需要把hook的输出拼接起来得到完整的句子的matrix
             for hook in hooker.hooks:
                 hook.outputs = [torch.cat([o for o in hook.outputs], dim=1)]
-                if hook.config.retain_input:
+                if hook.config.save_input:
                     hook.inputs= [torch.cat([o for o in hook.inputs], dim=1)]
             
             # 保存generate的句子和下一个token
