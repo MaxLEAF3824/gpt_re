@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import json
 import pathlib
 from typing import Dict, Optional, Sequence, Tuple, Union, List, Any
@@ -17,6 +17,7 @@ from model.dict_llm import DictLLM
 from rouge_chinese import Rouge
 import jieba
 import time
+import bert_score
 
 
 torch.manual_seed(42)
@@ -58,7 +59,10 @@ class ModelArguments:
     num_encoder_layers : int = field(default=12)
     max_length : int = field(default=1600)
     special_tokens_path : str = field(default=None)
-    no_mask : bool = field(default=False)
+    mask_strategy : str = field(default="hierarchical")
+    position_strategy : str = field(default="group")
+    encoder_type : str = field(default="transformer")
+    mapper_type : str = field(default="linear")
 
 @dataclass
 class DataArguments:
@@ -108,11 +112,6 @@ class DictLLMTrainer(Trainer):
                 loss = loss.mean().detach()
                 output_ids = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1], synced_gpus=True).to(dllm.llm.model.device)
         
-        # attn_weights = torch.vstack(list(outputs['attentions'])) # [layers, bsz, num_heads, q_len, kv_seq_len]
-        # attn_weights = torch.mean(attn_weights, dim=(0,1,2)) # [q_len, kv_seq_len]
-        # table_average_weight = attn_weights[dllm.num_table_token:,:dllm.num_table_token].sum(1).mean().item() # [text_len]
-        # self.log({"table_average_weight":table_average_weight})
-        
         return (loss, output_ids, labels)
 
 
@@ -137,16 +136,7 @@ def train():
     data_modules = dict(train_dataset=train_dst, eval_dataset=eval_dst, data_collator=data_collator)
     
     # Load Model
-    dllm = DictLLM(
-        model_args.mt_path, 
-        model_args.encoder_hidden_size, 
-        model_args.num_table_token, 
-        model_args.num_encoder_head, 
-        model_args.num_encoder_layers, 
-        model_args.max_length, 
-        model_args.special_tokens_path, 
-        model_args.no_mask
-    )
+    dllm = DictLLM(**asdict(model_args))
     model, tok = dllm, dllm.llm.tok
     
     # compute_metrics
@@ -156,23 +146,29 @@ def train():
         output_ids = [[i for i in ids if i != -100] for ids in output_ids]
         predictions = tok.batch_decode(output_ids, skip_special_tokens=True)
         predictions = [' '.join(jieba.cut(p)) for p in predictions]
+        predictions = ["--" if not p.strip() else p for p in predictions]
         
         label_ids = EvalPrediction.label_ids
         label_ids = label_ids.tolist()
         label_ids = [[i for i in ids if i != -100] for ids in label_ids]
         references = tok.batch_decode(label_ids, skip_special_tokens=True)
         references = [' '.join(jieba.cut(r)) for r in references]
-
+        
         rouge = Rouge()
-        scores = rouge.get_scores(predictions, references)
-        rougel_f1 = sum([s['rouge-l']['f'] for s in scores])/len(scores)
-        rougel_p = sum([s['rouge-l']['p'] for s in scores])/len(scores)
-        rougel_r = sum([s['rouge-l']['r'] for s in scores])/len(scores)
+        rouge_scores = rouge.get_scores(predictions, references)
+        rougel_f1 = sum([s['rouge-l']['f'] for s in rouge_scores])/len(rouge_scores)
+        rougel_p = sum([s['rouge-l']['p'] for s in rouge_scores])/len(rouge_scores)
+        rougel_r = sum([s['rouge-l']['r'] for s in rouge_scores])/len(rouge_scores)
         
-        for pred,ref,score in zip(predictions, references, scores):
-            rank0_print(f"ref: {ref} pred: {pred} rougeL-f1: {score['rouge-l']['f']}")
+        bert_scores = [s.cpu().tolist() for s in bert_score.score(predictions, references, lang='zh')] # p,r,f
+        bert_score_p = sum(bert_scores[0])/len(bert_scores[0])
+        bert_score_r = sum(bert_scores[1])/len(bert_scores[1])
+        bert_score_f1 = sum(bert_scores[2])/len(bert_scores[2])
         
-        return {'rougeL' : rougel_f1, 'rougeL-p' : rougel_p, 'rougeL-r':rougel_r}
+        for pred,ref,rouge_score,bscore in zip(predictions, references, rouge_scores, bert_scores[2]):
+            rank0_print(f"ref: {ref} pred: {pred} rougeL-f1: {rouge_score['rouge-l']['f']} bert_score_f1: {bscore}")
+        
+        return {'rougeL' : rougel_f1, 'rougeL-p' : rougel_p, 'rougeL-r':rougel_r, 'bert_score-p':bert_score_p, 'bert_score-r':bert_score_r, 'bert_score-f1':bert_score_f1}
     
     # Load Trainer
     trainer = DictLLMTrainer(model=model, tokenizer=tok, args=training_args, **data_modules, compute_metrics=compute_metrics)
