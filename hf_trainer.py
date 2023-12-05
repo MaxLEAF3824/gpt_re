@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, field, asdict
 import json
 import pathlib
@@ -16,7 +15,6 @@ from model.llm_utils import LoadWoInit
 from model.dict_llm import DictLLM
 from rouge_chinese import Rouge
 import jieba
-import time
 import bert_score
 
 
@@ -138,6 +136,17 @@ def train():
     # Load Model
     dllm = DictLLM(**asdict(model_args))
     model, tok = dllm, dllm.llm.tok
+    
+    # debug hook
+    # nan_ratio = lambda x: int(x.isnan().sum()/x.numel())
+    # dllm.dicts_encoder.transformer_encoder.register_forward_hook(
+    #     lambda self, args, kwargs, output: rank0_print(output.shape, nan_ratio(output)),
+    #     with_kwargs=True
+    # )
+    # dllm.llm.register_forward_hook(
+    #     lambda self, args, kwargs, output: rank0_print(output['logits'].shape, nan_ratio(output['logits']), output['loss']),
+    #     with_kwargs=True
+    # )
     
     # compute_metrics
     def compute_metrics(EvalPrediction):

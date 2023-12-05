@@ -10,7 +10,6 @@ import json
 import math
 import numpy as np 
 
-EPS = 1e-6
 
 def sinkhorn(dot, mask=None, eps=1e-03, return_kernel=False, max_iter=100):
     """
@@ -228,43 +227,42 @@ class OTLayer(nn.Module):
         return output
 
 def no_mask(seq_len, spans):
-    mask = torch.ones((1, seq_len, seq_len), dtype=torch.bool)
-    mask[:, :] = False
+    mask = torch.zeros((seq_len, seq_len), dtype=torch.bool)
+    mask[:, :] = True
     return mask
 
 def hierarchical_mask(seq_len, spans):
-    mask = torch.ones((1, seq_len, seq_len), dtype=torch.bool)
+    mask = torch.zeros((seq_len, seq_len), dtype=torch.bool)
     for span in spans:
         sep_idx = span[-1]
         for i, j in span[:-1]:
-            mask[i:j, i:j] = False
-            mask[i:j, sep_idx] = False
-            mask[sep_idx, i:j] = False
-        mask[-1, sep_idx] = False
-        mask[sep_idx, -1] = False
+            mask[i:j, i:j] = True
+            mask[i:j, sep_idx] = True
+            mask[sep_idx, i:j] = True
+        mask[-1, sep_idx] = True
+        mask[sep_idx, -1] = True
     return mask
 
 def half_mask(seq_len, spans):
-    mask = torch.ones((1, seq_len, seq_len), dtype=torch.bool)
+    mask = torch.zeros((seq_len, seq_len), dtype=torch.bool)
     sep_idxs = [0] + [span[-1] for span in spans]
     for sep_idx1, sep_idx2 in zip(sep_idxs[:-1], sep_idxs[1:]):
-        mask[sep_idx1:sep_idx2, sep_idx1:sep_idx2] = False
-        mask[sep_idx2, -1] = False
-        mask[-1, sep_idx2] = False
+        mask[sep_idx1:sep_idx2, sep_idx1:sep_idx2] = True
+        mask[sep_idx2, -1] = True
+        mask[-1, sep_idx2] = True
     return mask
 
 def no_position(seq_len, spans):
-    return torch.zeros((1, seq_len), dtype=torch.long)
+    return torch.zeros(seq_len, dtype=torch.long).reshape(-1)
 
 def navie_position(seq_len, spans):
-    return torch.arange(seq_len, dtype=torch.long).reshape(1, -1)
+    return torch.arange(seq_len, dtype=torch.long).reshape(-1)
 
 def group_position(seq_len, spans):
-    pos_ids = torch.zeros((1, seq_len), dtype=torch.long)
+    pos_ids = torch.zeros(seq_len, dtype=torch.long).reshape(-1)
     for span in spans:
-        sep_idx = span[-1]
         for i, j in span[:-1]:
-            pos_ids[0, i:j] = torch.arange(j-i, dtype=torch.long) + 1
+            pos_ids[i:j] = torch.arange(j-i, dtype=torch.long) + 1
     return pos_ids
 
 MASK_STRATEGIES = {
@@ -295,6 +293,7 @@ class DictsEncoder(nn.Module):
                  **kwargs):
         super(DictsEncoder, self).__init__()
         self.encoder_hidden_size = encoder_hidden_size
+        self.output_dim = output_dim
         self.num_encoder_head = num_encoder_head
         self.num_encoder_layers = num_encoder_layers
         self.special_tokens_path = special_tokens_path
@@ -345,13 +344,15 @@ class DictsEncoder(nn.Module):
     def prepare_batch_input(self, batch_dicts: List[List[Dict]]):
         '''
         input_ids: torch.LongTensor with shape of (batch_size, seq_len)
-        attention_mask: torch.FloatTensor with shape of (batch_size, seq_len, seq_len)
+        mask: torch.BoolTensor with shape of (batch_size, seq_len, seq_len)
+        ATTENTION!!! True for tokens that are **not masked**, False for tokens that are **masked**
         position_ids : torch.LongTensor with shape of (batch_size, seq_len)
         '''
         sep_id = self.tok.convert_tokens_to_ids('[SEP]')
         cls_id = self.tok.convert_tokens_to_ids('[CLS]')
+        batch_size = len(batch_dicts)
         batch_input_ids = []
-        batch_attention_mask = []
+        batch_mask = []
         batch_position_ids = []
         for dicts in batch_dicts:
             spans = [] # save the span of each key-value pair
@@ -368,53 +369,55 @@ class DictsEncoder(nn.Module):
                 input_ids.append(sep_id)
                 spans.append(span)
             input_ids.append(cls_id)
-            input_ids = torch.tensor(input_ids, dtype=torch.long).reshape(1, -1)
+            input_ids = torch.tensor(input_ids, dtype=torch.long).reshape(-1)
             seq_len = input_ids.shape[-1]
 
-            attention_mask = torch.zeros((1, seq_len, seq_len), dtype=torch.float)
-            mask = MASK_STRATEGIES.get(self.mask_strategy, no_mask)(seq_len, spans) # mask is True means that there will be an attention mask(-inf) here
-            attention_mask[mask] = float('-inf')
-            
+            mask = MASK_STRATEGIES.get(self.mask_strategy, no_mask)(seq_len, spans) # ATTENTION!!! True for tokens that are **not masked**, False for tokens that are **masked**
             position_ids = POSITION_STRATEGIES.get(self.position_strategy, no_position)(seq_len, spans)
             
             batch_input_ids.append(input_ids)
-            batch_attention_mask.append(attention_mask)
+            batch_mask.append(mask)
             batch_position_ids.append(position_ids)
         
         max_len = max([input_ids.shape[-1] for input_ids in batch_input_ids])
-        batch_input_ids = [F.pad(input_ids, (0, max_len - input_ids.shape[-1]), value=self.tok.pad_token_id) for input_ids in batch_input_ids]
-        batch_attention_mask = [F.pad(attention_mask, (0, max_len - attention_mask.shape[-1], 0, max_len - attention_mask.shape[-1]), value=float('-inf')) for attention_mask in batch_attention_mask]
-        batch_position_ids = [F.pad(position_ids, (0, max_len - position_ids.shape[-1]), value=0) for position_ids in batch_position_ids]
+        batch_input_ids = [F.pad(input_ids, (max_len - input_ids.shape[-1], 0), value=self.tok.pad_token_id).reshape(max_len) for input_ids in batch_input_ids]
+        batch_mask = [F.pad(mask, (max_len - mask.shape[-1], 0, max_len - mask.shape[-1], 0), value=False).reshape(max_len, max_len) for mask in batch_mask]
+        batch_position_ids = [F.pad(position_ids, (max_len - position_ids.shape[-1], 0), value=self.max_position_embeddings - 2).reshape(max_len) for position_ids in batch_position_ids]
         
-        input_ids = torch.cat(batch_input_ids, dim=0)
-        attention_mask = torch.cat(batch_attention_mask, dim=0)
-        position_ids = torch.cat(batch_position_ids, dim=0)
+        input_ids = torch.vstack(batch_input_ids).reshape(batch_size, max_len)
+        mask = torch.vstack(batch_mask).reshape(batch_size, max_len, max_len)
+        position_ids = torch.vstack(batch_position_ids).reshape(batch_size, max_len)
         
-        return input_ids, attention_mask, position_ids
+        return input_ids, mask, position_ids, spans
     
-    def encoder_batch_forward(self, input_ids, attention_mask, position_ids):
+    def encoder_batch_forward(self, input_ids, mask, position_ids):
         """Encoder Forward
 
         Args:
             input_ids (torch.LongTensor): (batch_size, seq_len)
-            attention_mask (torch.FloatTensor): (batch_size, seq_len, seq_len)
+            mask: torch.BoolTensor with shape of (batch_size, seq_len, seq_len)
             position_ids (torch.LongTensor): (batch_size, seq_len)
 
         Returns:
             output (torch.FloatTensor): (batch_size, seq_len, hidden_size)
         """
         if self.encoder_type == 'transformer':
+            batch_size, seq_len = input_ids.shape
             input_ids = input_ids.to(self.embedding.weight.device)
-            attention_mask = attention_mask.to(self.embedding.weight.device)
+            attention_mask = torch.zeros((seq_len, seq_len), dtype=torch.float)
+            NINF = torch.finfo(torch.float16).min
+            attention_mask[~mask] = NINF
+            attn_mask_3d = torch.repeat_interleave(attention_mask, self.num_encoder_head, dim=0).to(self.embedding.weight.device)  # [N * H, T, S]
             position_ids = position_ids.to(self.embedding.weight.device)
-            src = (self.embedding(input_ids) + self.position_embedding(position_ids)).reshape(1, -1)
-            output = self.transformer_encoder(src=src, mask=attention_mask)
+            src = (self.embedding(input_ids) + self.position_embedding(position_ids)).reshape(batch_size, seq_len, -1)
+            output = self.transformer_encoder(src=src, mask=attn_mask_3d)
             return output
         elif self.encoder_type == 'bert':
+            attention_mask = mask.to(torch.float)
             output = self.bert(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)['last_hidden_state']
             return output
     
-    def mapper_batch_forward(self, encoder_output):
+    def mapper_batch_forward(self, encoder_output, spans):
         """Mapper Forward
 
         Args:
@@ -424,17 +427,20 @@ class DictsEncoder(nn.Module):
             output (torch.FloatTensor): (batch_size, self.num_table_token, self.output_dim)
         """
         if self.mapper_type == 'otk':
-            output = self.ot_layer(encoder_output)
+            sep_idxs = [span[-1] for span in spans]
+            mapper_input = encoder_output[:, sep_idxs, :]
+            output = self.ot_layer(mapper_input)
             return output
         elif self.mapper_type == 'linear':
-            output = self.linear_mapper(encoder_output)
+            mapper_input = encoder_output[:, -1, :]
+            output = self.linear_mapper(mapper_input)
             output = output.reshape(-1, self.num_table_token, self.output_dim)
             return output
         
     def forward(self, batch_dicts: List[List[Dict]]):
-        input_ids, attention_mask, position_ids = self.prepare_batch_input(batch_dicts)
-        encoder_output = self.encoder_batch_forward(input_ids, attention_mask, position_ids)
-        output = self.mapper_batch_forward(encoder_output)
+        input_ids, mask, position_ids, spans = self.prepare_batch_input(batch_dicts)
+        encoder_output = self.encoder_batch_forward(input_ids, mask, position_ids)
+        output = self.mapper_batch_forward(encoder_output, spans)
         output = self.norm(output)
         return output
 
@@ -506,14 +512,13 @@ class DictLLM(nn.Module):
 
     def generate(self, input_text: List[str], dicts: List[List[Dict[str, str]]] = None, label_text: List[str] = None, cut_input=False, **genkwargs):
          # only support batch_size=1 now
-        input_text = input_text[0] 
+        # input_text = input_text[0] 
         inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
         input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
         if not dicts:
-            output_ids = self.llm.model.generate(input_ids=input_ids.to(
-                self.llm.model.device), attention_mask=attention_mask.to(self.llm.model.device), **genkwargs)
+            output_ids = self.llm.model.generate(input_ids=input_ids.to(self.llm.model.device), attention_mask=attention_mask.to(self.llm.model.device), **genkwargs)
         else:
-            dicts = dicts[0]
+            # dicts = dicts[0]
             with torch.no_grad():
                 dicts_embedding = self.dicts_encoder(dicts).reshape((1, self.num_table_token, self.output_dim))
             input_ids = F.pad(input_ids, (self.num_table_token, 0), value=self.llm.tok.pad_token_id)

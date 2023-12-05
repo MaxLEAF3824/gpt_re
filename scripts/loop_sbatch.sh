@@ -21,5 +21,5 @@ do
         echo "$now $1 is not submited, submitting..."
         sbatch $1.job
     fi
-    sleep 10
+    sleep 180
 done
