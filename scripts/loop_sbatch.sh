@@ -10,6 +10,7 @@ now=$(date "+%Y-%m-%d %H:%M:%S")
 if ! [ -n "$(squeue -u $USER --long| grep $1)" ]; then 
     echo "$now $1 is not submited, submitting..."
     sbatch $1.job
+    sleep 5
 else
     echo "$now $1 is already submited, monitoring..."
 fi
@@ -20,6 +21,7 @@ do
     if ! [ -n "$(squeue -u $USER --long| grep $1)" ]; then 
         echo "$now $1 is not submited, submitting..."
         sbatch $1.job
+        sleep 5
     fi
     sleep 180
 done

@@ -1,4 +1,4 @@
-from typing import Dict, List
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +9,8 @@ import os
 import json
 import math
 import numpy as np 
+from typing import List, Dict
+from functools import partial
 
 
 def sinkhorn(dot, mask=None, eps=1e-03, return_kernel=False, max_iter=100):
@@ -278,7 +280,7 @@ POSITION_STRATEGIES = {
 }
 
 
-class DictsEncoder(nn.Module):
+class DictEncoder(nn.Module):
     def __init__(self, encoder_hidden_size,
                  output_dim,
                  num_encoder_head,
@@ -291,7 +293,7 @@ class DictsEncoder(nn.Module):
                  mapper_type,
                  max_position_embeddings=4096,
                  **kwargs):
-        super(DictsEncoder, self).__init__()
+        super(DictEncoder, self).__init__()
         self.encoder_hidden_size = encoder_hidden_size
         self.output_dim = output_dim
         self.num_encoder_head = num_encoder_head
@@ -338,26 +340,27 @@ class DictsEncoder(nn.Module):
         if mapper_type == 'otk':
             self.ot_layer = OTLayer(in_dim=encoder_hidden_size, out_size=num_table_token,heads=1,eps=0.1,max_iter=30,out_dim=output_dim)
         elif mapper_type == 'linear':
-            self.linear_mapper = nn.Linear(encoder_hidden_size, output_dim * num_table_token)
+            self.linear1 = nn.Linear(encoder_hidden_size, output_dim)
+            self.linear2 = nn.Linear(1, num_table_token)
         self.norm = nn.LayerNorm(output_dim)
-        
-    def prepare_batch_input(self, batch_dicts: List[List[Dict]]):
+    
+    def prepare_batch_input(self, batch_dict: List[List[Dict]]):
         '''
         input_ids: torch.LongTensor with shape of (batch_size, seq_len)
         mask: torch.BoolTensor with shape of (batch_size, seq_len, seq_len)
-        ATTENTION!!! True for tokens that are **not masked**, False for tokens that are **masked**
+        ATTENTION!!! mask is True for tokens that are **not masked**, False for tokens that are **masked**
         position_ids : torch.LongTensor with shape of (batch_size, seq_len)
         '''
         sep_id = self.tok.convert_tokens_to_ids('[SEP]')
         cls_id = self.tok.convert_tokens_to_ids('[CLS]')
-        batch_size = len(batch_dicts)
+        batch_size = len(batch_dict)
         batch_input_ids = []
         batch_mask = []
         batch_position_ids = []
-        for dicts in batch_dicts:
+        for dict in batch_dict:
             spans = [] # save the span of each key-value pair
             input_ids = []
-            for d in dicts:
+            for d in dict:
                 span = []
                 for key, value in d['data'].items():
                     key_ids = self.tok(key, add_special_tokens=False)['input_ids']
@@ -402,19 +405,27 @@ class DictsEncoder(nn.Module):
             output (torch.FloatTensor): (batch_size, seq_len, hidden_size)
         """
         if self.encoder_type == 'transformer':
+            device = self.embedding.weight.device
+            dtype = self.embedding.weight.data.dtype
             batch_size, seq_len = input_ids.shape
-            input_ids = input_ids.to(self.embedding.weight.device)
-            attention_mask = torch.zeros((seq_len, seq_len), dtype=torch.float)
-            NINF = torch.finfo(torch.float16).min
+            attention_mask = torch.zeros_like(mask, dtype=dtype)
+            NINF = torch.finfo(dtype).min
             attention_mask[~mask] = NINF
-            attn_mask_3d = torch.repeat_interleave(attention_mask, self.num_encoder_head, dim=0).to(self.embedding.weight.device)  # [N * H, T, S]
-            position_ids = position_ids.to(self.embedding.weight.device)
+            attn_mask_3d = torch.repeat_interleave(attention_mask, self.num_encoder_head, dim=0).to(device)  # [N * H, T, S]
+            input_ids = input_ids.to(device)
+            position_ids = position_ids.to(device)
             src = (self.embedding(input_ids) + self.position_embedding(position_ids)).reshape(batch_size, seq_len, -1)
+            del input_ids
+            del position_ids
             output = self.transformer_encoder(src=src, mask=attn_mask_3d)
+            del attn_mask_3d
             return output
         elif self.encoder_type == 'bert':
-            attention_mask = mask.to(torch.float)
+            device = self.bert.embeddings.word_embeddings.weight.device
+            dtype = self.bert.embeddings.word_embeddings.weight.data.dtype
+            attention_mask = mask.to(dtype).to(device)
             output = self.bert(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)['last_hidden_state']
+            del attention_mask
             return output
     
     def mapper_batch_forward(self, encoder_output, spans):
@@ -432,109 +443,170 @@ class DictsEncoder(nn.Module):
             output = self.ot_layer(mapper_input)
             return output
         elif self.mapper_type == 'linear':
-            mapper_input = encoder_output[:, -1, :]
-            output = self.linear_mapper(mapper_input)
+            mapper_input = encoder_output[:, -1, :].unsqueeze(1) # [batch_size, hidden_size]
+            output = self.linear1(mapper_input).transpose(1,2)
+            output = self.linear2(output).transpose(1,2)
             output = output.reshape(-1, self.num_table_token, self.output_dim)
             return output
         
-    def forward(self, batch_dicts: List[List[Dict]]):
-        input_ids, mask, position_ids, spans = self.prepare_batch_input(batch_dicts)
+    def forward(self, batch_dict: List[List[Dict]]):
+        input_ids, mask, position_ids, spans = self.prepare_batch_input(batch_dict)
         encoder_output = self.encoder_batch_forward(input_ids, mask, position_ids)
         output = self.mapper_batch_forward(encoder_output, spans)
         output = self.norm(output)
         return output
 
+def full_edit_func(module, input_args, input_kwargs, output, batch_idxs, batch_embeddings: List[List]):
+    hidden_states = output[0] if isinstance(output, tuple) else output
+    batch_size, seq_len, _ = hidden_states.shape
+
+    is_in_generation = (seq_len == 1)
+    if is_in_generation:
+        return output
+    print("edit is done.")
+    for i in range(batch_size):
+        for j, table_idx in enumerate(batch_idxs[i]):
+            sub_embedding = batch_embeddings[i][j]
+            num_table_token = sub_embedding.shape[0]
+            hidden_states[i, table_idx:table_idx+num_table_token, :] = sub_embedding
+    
+    return (hidden_states, *output[1:]) if isinstance(output, tuple) else hidden_states
 
 class DictLLM(nn.Module):
-    def __init__(self, 
-                 mt_path,
-                 encoder_hidden_size,
-                 num_table_token,
-                 num_encoder_head,
-                 num_encoder_layers,
-                 max_length,
-                 special_tokens_path,
-                 mask_strategy,
-                 position_strategy,
-                 encoder_type,
-                 mapper_type,
-):
+    def __init__(
+        self, 
+        mt_path,
+        encoder_hidden_size,
+        num_table_token,
+        num_encoder_head,
+        num_encoder_layers,
+        special_tokens_path,
+        mask_strategy,
+        position_strategy,
+        encoder_type,
+        mapper_type,
+        deep_fusion,
+    ):
         super(DictLLM, self).__init__()
         self.num_table_token = num_table_token
         self.encoder_hidden_size = encoder_hidden_size
-        self.max_length = max_length
-        self.llm = LLM.from_pretrained(mt_path=mt_path).float()
+        self.deep_fusion = deep_fusion
+        self.fusion_layers = []
+        self.llm = LLM.from_pretrained(mt_path=mt_path, torch_dtype=torch.float32)
+        self.table_token = "[TABLE]"
+        self.llm.tok.add_tokens([self.table_token])
+        self.llm.tok.padding_side = "left"
+        self.table_token_id = self.llm.tok.convert_tokens_to_ids(self.table_token)
         self.output_dim = self.llm.embedding.embedding_dim
-        self.dicts_encoder = DictsEncoder(encoder_hidden_size=encoder_hidden_size, 
-                                          output_dim=self.output_dim,
-                                          num_encoder_head=num_encoder_head,
-                                          num_encoder_layers=num_encoder_layers,
-                                          special_tokens_path=special_tokens_path,
-                                          num_table_token=num_table_token,
-                                          mask_strategy=mask_strategy,
-                                          position_strategy=position_strategy,
-                                          encoder_type=encoder_type,
-                                          mapper_type=mapper_type,)
+        if self.deep_fusion:
+            self.fusion_layers = list(range(len(self.llm.block)))
+        self.config = self.llm.model.config
+        self.dict_encoder = DictEncoder(
+            encoder_hidden_size=encoder_hidden_size,
+            output_dim=self.output_dim,
+            num_encoder_head=num_encoder_head,
+            num_encoder_layers=num_encoder_layers,
+            special_tokens_path=special_tokens_path,
+            num_table_token=num_table_token*(len(self.fusion_layers) + 1),
+            mask_strategy=mask_strategy,
+            position_strategy=position_strategy,
+            encoder_type=encoder_type,
+            mapper_type=mapper_type,
+        )
 
-    def forward(self, input_text: List[str], dicts: List[List[Dict[str, str]]] = None, label_text: List[str] = None, **kwargs):
-        batch_size = len(input_text)
-        inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
-        input_ids, attention_mask, labels = inp['input_ids'], inp['attention_mask'], None
-
-        if label_text is not None:
-            label_text = [t + f" {self.llm.tok.eos_token}" for t in label_text]
+    def gradient_checkpointing_enable(self):
+        self.llm.model.gradient_checkpointing_enable()
+    
+    def prepare_batch_input(self, batch_input_text : List[str], batch_dicts : List[List[List[Dict[str, str]]]] = None, batch_label_text : List[str] = None):
+        # legal check
+        batch_size = len(batch_input_text)
+        device = self.llm.embedding.weight.data.device
+        batch_dicts = [[] for i in range(batch_size)] if not batch_dicts else batch_dicts
+        batch_num_stamps = [text.count(self.table_token) for text in batch_input_text]
+        batch_num_dicts = [len(dicts) for dicts in batch_dicts]
+        assert batch_num_stamps == batch_num_dicts, f"wrong dict num : {batch_num_stamps} table_token and {batch_num_dicts} dict"
+        
+        # input_ids, attention_mask     
+        batch_input_text = [text.replace(self.table_token, "".join([self.table_token]*self.num_table_token)) for text in batch_input_text]
+        inp = self.llm.tok(batch_input_text, padding=True, return_tensors='pt')
+        input_ids, attention_mask = inp['input_ids'].to(device), inp['attention_mask'].to(device)
+        
+        # batch_table_idxs
+        batch_table_idxs = []
+        for i in range(batch_size):
+            batch_table_idxs.append([])
+            j = 0
+            while j <= len(input_ids[i])-self.num_table_token:
+                if torch.all(input_ids[i, j:j+self.num_table_token] == self.table_token_id):
+                    batch_table_idxs[i].append(j)
+                    j += self.num_table_token
+                else:
+                    j += 1
+        
+        # labels
+        labels = None
+        if batch_label_text:
+            batch_label_text = [t + f" {self.llm.tok.eos_token}" for t in batch_label_text]
             input_lens = attention_mask.sum(dim=1)
-            all_text = [t1 + t2 for t1, t2 in zip(input_text, label_text)]
+            all_text = [t1 + t2 for t1, t2 in zip(batch_input_text, batch_label_text)]
             inp = self.llm.tok(all_text, padding=True, return_tensors='pt')
-            input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
+            input_ids, attention_mask = inp['input_ids'].to(device), inp['attention_mask'].to(device)
             all_lens = attention_mask.sum(dim=1)
             labels = torch.ones_like(input_ids) * -100
             for i in range(batch_size):
-                labels[i, input_lens[i]:all_lens[i]] = input_ids[i, input_lens[i]:all_lens[i]]
+                labels[i, input_lens[i]:all_lens[i]] = input_ids[i, input_lens[i]:all_lens[i]].to(device)
+        
+        # replace table_token_id
+        input_ids = input_ids.masked_fill(input_ids == self.table_token_id, self.llm.tok.pad_token_id)
+        
+        hook_configs = []
+        # batch_dict_embeddings
+        batch_dict_embeddings = [[] for i in range(batch_size)]
+        all_dicts = [dict for dicts in batch_dicts for dict in dicts]
+        if len(all_dicts) > 0:
+            all_dict_embedding = self.dict_encoder(all_dicts).reshape((-1, self.num_table_token, len(self.fusion_layers) + 1, self.output_dim)).to(device)
+            idx = 0
+            for i, num_dicts in enumerate(batch_num_dicts):
+                for j in range(num_dicts):
+                    batch_dict_embeddings[i].append(all_dict_embedding[idx])
+                    idx += 1
+        
+        # hook_configs
+        # embedding_hook_config
+        batch_emb_sub_embeddings = [[dict_embedding[:,0,:] for dict_embedding in dict_embeddings] for dict_embeddings in batch_dict_embeddings]
+        hook_configs.append(LLMHookerConfig(
+            "embedding", 
+            save_output=False, 
+            edit_output=partial(full_edit_func, batch_idxs=batch_table_idxs, batch_embeddings=batch_emb_sub_embeddings)
+        ))
+        
+        # deep_fusion_hook_config
+        for layer_idx in self.fusion_layers:
+            batch_layer_sub_embeddings = [[dict_embedding[:,layer_idx+1,:] for dict_embedding in dict_embeddings] for dict_embeddings in batch_dict_embeddings]
+            hook_configs.append(LLMHookerConfig(
+                "block", 
+                layer=layer_idx, 
+                save_output=False, 
+                edit_output=partial(full_edit_func, batch_idxs=batch_table_idxs, batch_embeddings=batch_layer_sub_embeddings)
+            ))
+        
+        return input_ids, attention_mask, labels, hook_configs
+        
+    def forward(self, batch_input_text : List[str], batch_dicts : List[List[List[Dict[str, str]]]] = None, batch_label_text : List[str] = None, **kwargs):
+        input_ids, attention_mask, labels, hook_configs = self.prepare_batch_input(batch_input_text, batch_dicts, batch_label_text)
 
-        input_ids = input_ids[:, :self.max_length].to(self.llm.model.device)
-        inputs_embeds = self.llm.embedding(input_ids)
+        with LLMHooker(self.llm, hook_configs):
+            model_output = self.llm.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
 
-        if dicts:
-            dicts_embedding = self.dicts_encoder(dicts).reshape((batch_size, self.num_table_token, self.output_dim))
-            inputs_embeds = torch.cat([dicts_embedding, inputs_embeds], dim=1)
-            attention_mask = torch.cat([torch.ones((batch_size, self.num_table_token), dtype=torch.long), attention_mask], dim=1)
-            if labels is not None:
-                labels = torch.cat([torch.ones((batch_size, self.num_table_token), dtype=torch.long) * -100, labels], dim=1).type(torch.long)
-
-        inputs_embeds = inputs_embeds[:, :self.max_length, :]
-        attention_mask = attention_mask[:, :self.max_length].to(self.llm.model.device)
-        if labels is not None:
-            labels = labels[:, :self.max_length]
-
-        model_output = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
         return model_output
-
-    def generate(self, input_text: List[str], dicts: List[List[Dict[str, str]]] = None, label_text: List[str] = None, cut_input=False, **genkwargs):
-         # only support batch_size=1 now
-        # input_text = input_text[0] 
-        inp = self.llm.tok(input_text, padding=True, return_tensors='pt')
-        input_ids, attention_mask = inp['input_ids'], inp['attention_mask']
-        if not dicts:
-            output_ids = self.llm.model.generate(input_ids=input_ids.to(self.llm.model.device), attention_mask=attention_mask.to(self.llm.model.device), **genkwargs)
-        else:
-            # dicts = dicts[0]
-            with torch.no_grad():
-                dicts_embedding = self.dicts_encoder(dicts).reshape((1, self.num_table_token, self.output_dim))
-            input_ids = F.pad(input_ids, (self.num_table_token, 0), value=self.llm.tok.pad_token_id)
-            attention_mask = F.pad(attention_mask, (self.num_table_token, 0), value=1)
-
-            def edit_func(module, input_args, input_kwargs, output):
-                # if is first forward, not in the process of generation
-                if input_args[0].numel() > 1:
-                    output[0, :self.num_table_token, :] = dicts_embedding.to(
-                        module.weight.data.device)
-                return output
-
-            with LLMHooker(self.llm, LLMHookerConfig("embedding", save_output=False, edit_output=edit_func)):
-                output_ids = self.llm.model.generate(input_ids=input_ids.to(self.llm.model.device), attention_mask=attention_mask.to(self.llm.model.device), **genkwargs)
-
-        if cut_input:
-            output_ids = output_ids[:, input_ids.shape[-1]:]
-
-        return output_ids
+    
+    @torch.no_grad()
+    def generate(self, batch_input_text: List[str], batch_dicts: List[List[List[Dict[str, str]]]] = None, batch_label_text: List[str] = None, cut_input=False, **genkwargs):
+        assert len(batch_input_text) == 1, "generate only support batch_size=1 now"
+        
+        input_ids, attention_mask, labels, hook_configs = self.prepare_batch_input(batch_input_text, batch_dicts, batch_label_text)
+        
+        with LLMHooker(self.llm, hook_configs):
+            output_ids = self.llm.model.generate(input_ids=input_ids, attention_mask=attention_mask, **genkwargs)
+        
+        return output_ids[:, input_ids.shape[-1]:] if cut_input else output_ids

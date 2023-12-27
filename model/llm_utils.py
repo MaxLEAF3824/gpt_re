@@ -17,7 +17,6 @@ import logging
 import pynvml
 
 
-
 def multithread_query_chatgpt(queries: List[Dict], thread_num=1, max_round=10, model_name="gpt-3.5-turbo-1106", temperature=0.0, **kwargs):
     all_answers = []
     round = 1

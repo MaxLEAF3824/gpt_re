@@ -83,11 +83,11 @@ class LLMHooker:
     
     def __init__(self, mt, config: Union[List[LLMHookerConfig], LLMHookerConfig]):
         self.mt = mt
-        self.config_list = config if isinstance(config, list) else [config]
+        self.configs = config if isinstance(config, list) else [config]
         self.hooks = []
     
     def __enter__(self):
-        for config in self.config_list:
+        for config in self.configs:
             module = getattr(self.mt, config.module_name)
             
             if not module:
