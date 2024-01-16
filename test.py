@@ -1,166 +1,229 @@
-# 生成v3.2/checkout_data_train训练数据集
-# 数据来源：各大内科，使用bert_score筛选与化验相关度高的数据，进一步清洗了出院诊断
+# 生成v3.3/checkout_data_train训练数据集
+# 数据来源：各大内科，使用bert_score筛选与化验相关度高的数据，进一步清洗了出院诊断，并对出院诊断做了归一化
 # 进一步增加了stage1 Encoder预训练数据，任务：还原化验单的异常表项
 import json
 import os
 import pandas as pd
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BertModel
 from tqdm import tqdm
 import re
 import random
+import multiprocessing
+import torch
+import faiss
 
 
-llm_tok = AutoTokenizer.from_pretrained(os.path.join(os.environ['my_models_dir'],'internlm-7b'), trust_remote_code=True)
-encoder_tok = AutoTokenizer.from_pretrained(os.path.join(os.environ['my_models_dir'],'bert-base-chinese'), trust_remote_code=True)
 data_path = os.path.join(os.environ['my_datasets_dir'], "ninth/checkout_data_im_with_checks.json")
 ft_eval_ratio = 0.05
-prtrain_eval_ratio = 0.01
+pt_eval_ratio = 0.01
 bert_score_f1_threshold = 0.8
-max_length1 = 768 # max length for input text
-max_length2 = 1600 # max length for input text + text dicts
-max_ft_data_size = 13000 # FT 训练数据集规模
+max_dict_token_num = 4096  # max_length for dict token num
+max_pt_token_num = 80  # max length for pretrain_input text + pt_output text
+max_ft_token_num = 768  # max length for ft_input text + ft_output text
+max_ft_text_token_num = 8192  # max length for ft_input text + text dicts + ft_output text
+max_ft_data_size = 20000  # FT 训练数据集规模
+max_pt_data_size = 20000  # Pretrain 训练数据集规模
+max_num_abnormal_sample = 10  # 每个化验单最多sample的异常检验项目数
 seed = 42
-version = "3.2"
-table_token='[TABLE]'
-max_length3 = 128
-max_pretrain_data_size = 20000 # Pretrain 训练数据集规模
-max_num_abnormal_sample = 10 # 每个化验单最多sample的异常检验项目数
-pretrain_templates = [
-    f"{table_token} 请输出{max_num_abnormal_sample}个化验单中包含的异常检验项目。输出:",
-    f"{table_token} 请列出{max_num_abnormal_sample}个化验单中的所有异常检验结果。输出:",
-    f"{table_token} 告诉我化验单里{max_num_abnormal_sample}个异常的检验项目。输出:",
-    f"{table_token} 我需要知道化验单上{max_num_abnormal_sample}个不正常的检验指标。输出:",
-    f"{table_token} 请展示化验单上{max_num_abnormal_sample}个异常的检测项。",
-    f"{table_token} 查看化验单，并标出其中{max_num_abnormal_sample}个不正常的检验项目。输出:",
-    f"{table_token} 需要了解化验单中哪些项目的检测结果异常，列出{max_num_abnormal_sample}个。输出:",
-    f"{table_token} 请指出化验单中{max_num_abnormal_sample}个存在异常的检验指标。输出:",
-    f"{table_token} 化验单里有哪些项目检测出现异常，请列出来{max_num_abnormal_sample}个。输出:",
-    f"{table_token} 请识别并报告{max_num_abnormal_sample}个化验单上的异常检测项目。输出:",
-    f"{table_token} 检查化验单，并确定哪些检验项目是异常的，列出{max_num_abnormal_sample}个。输出:"
+version = "3.3"
+table_token = '[TABLE]'
+bios_index = faiss.read_index(os.path.join(os.environ['my_datasets_dir'], "bios_v2.2_release/CoreData/TermDiseaseZHEmbedding_HNSW64.index"))
+bios_term2cid = json.load(open((os.path.join(os.environ['my_datasets_dir'], "bios_v2.2_release/CoreData/TermDiseaseZH.json"))))
+cid2bios_term = {v:k for (k,v) in bios_term2cid.items()}
+bios_terms = list(bios_term2cid.keys())
+bert = BertModel.from_pretrained(os.path.join(os.environ['my_models_dir'], 'bert-base-chinese'))
+bert.eval()
+term2bterm = json.load(open(os.path.join(os.environ['my_datasets_dir'], "bios_v2.2_release/CoreData/term2bterm.json")))
+
+pt_templates = [
+    f"{table_token} 请根据化验单结果输出病人可能患有的疾病。输出:",
+    f"{table_token} 请依据化验单的结果判断病人可能的疾病。输出:",
+    f"{table_token} 根据化验单结果，请推测病人可能罹患的疾病。输出:",
+    f"{table_token} 请分析化验单结果并指出病人可能遭受的疾病。输出:",
+    f"{table_token} 基于化验单结果，预测病人可能患有哪些疾病。",
+    f"{table_token} 请从化验单结果中判断出病人可能的疾病。输出:",
+    f"{table_token} 根据化验单的结果，推断病人可能的健康问题。输出:",
+    f"{table_token} 请查看化验单结果并识别可能的疾病。输出:",
+    f"{table_token} 请解读化验单结果，判断病人可能面临的疾病。输出:",
+    f"{table_token} 根据化验单结果，确定病人可能患的疾病。输出:",
+    f"{table_token} 分析化验单结果并预判病人可能的疾病。输出:"
 ]
 
+ft_text_template = "性别:{}\n年龄:{}\n入院时主要症状及体征:{}\n特殊检查及重要会诊:{}\n出院诊断:"
+ft_template = "化验信息:{}文字信息:{}"
+llm_tok = AutoTokenizer.from_pretrained(os.path.join(os.environ['my_models_dir'], 'internlm-7b'), trust_remote_code=True)
+bert_tok = AutoTokenizer.from_pretrained(os.path.join(os.environ['my_models_dir'], 'bert-base-chinese'), trust_remote_code=True)
+bert_tok.add_tokens([table_token])
 random.seed(seed)
 tqdm.pandas()
 
-df = pd.read_json(data_path)
-df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
-print('full df size: ', df.shape[0])
+# get data_df
+data = json.load(open(data_path))
+data = random.sample(data, len(data))
+print(f'full df size: {len(data)}')
 
-data_df = df.progress_apply(
-    lambda r: pd.Series(
-        dict(
-            input="性别:"+r['性别']+"\n年龄:"+r['年龄']+"\n入院时主要症状及体征:"+r['入院时主要症状及体征'].replace("\n","")+"\n特殊检查及重要会诊:"+r['特殊检查及重要会诊'].replace("\n","")+"\n出院诊断:",
-            data=r['完整化验结果'], 
-            output=r['出院诊断'],
-        )
-    ),
-    axis=1
-)
+def topk_index(index: pd.Series, k):
+    count = 0
+    for i in index.index:
+        if index[i]:
+            count += 1
+            if count > k:
+                index[i] = False
+    return index
 
+def normalize_term(term):
+    if term in term2bterm:
+        return term2bterm[term]
+    with torch.no_grad():
+        term_embedding = bert(bert_tok(term, return_tensors='pt')['input_ids'])['last_hidden_state'][:,0].cpu().numpy()
+    D,I = bios_index.search(term_embedding, 1)
+    cid = bios_term2cid[bios_terms[I[0][0]]]
+    bios_term = cid2bios_term[cid]
+    term2bterm[term] = bios_term
+    return bios_term
+    
 def get_abnormal_items(dict):
     abnormal_items = []
     for d in dict:
-        for (k,v) in d['data'].items():
+        for (k, v) in d['data'].items():
             if v in ["空", "阳性", "阳性(+)", "弱阳性", "极弱阳性"]:
                 abnormal_items.append(k)
     if abnormal_items:
         num_sample = min(len(abnormal_items), max_num_abnormal_sample)
         abnormal_items = random.sample(abnormal_items, num_sample)
-        return ", ".join(abnormal_items)
+        return "，".join(abnormal_items)
     else:
         return "无"
 
-data_df_pretrain = data_df.progress_apply(
-    lambda r: pd.Series(
-        dict(
-            input=random.choice(pretrain_templates),
-            data=[[dict(header=d['header'],data=d['data']) for d in r['data']]],
-            output=get_abnormal_items(r['data'])
-        )
-    ),
-    axis=1
-)
+def get_label_data_str(dict):
+    dict_str = ""
+    for d in dict:
+        for (k, v) in d['data'].items():
+            if v == "N":
+                v = "正常"
+            elif v == "空":
+                v = "异常"
+            dict_str += f"{k}{v} "
+        dict_str += "[SEP]"
+    return dict_str
 
-data_df_pretrain['num_tokens'] = data_df_pretrain.progress_apply(lambda r : len(llm_tok(r['input']+r['output'])['input_ids']), axis=1)
-data_df_pretrain = data_df_pretrain[data_df_pretrain['num_tokens'] < max_length3]
-print(f"filterd by max_length3: {data_df_pretrain.shape[0]} left")
+def preprocess_data(d):    
+    label_data = [[dict(header=d['header'], data=d['data']) for d in d['完整化验结果']]]
+    raw_data = [[dict(header=d['header'], data=d['raw_data']) for d in d['完整化验结果']]]
+    label_data_str = get_label_data_str(d['完整化验结果'])
+    
+    diagnosis = d['出院诊断']
+    diagnosis = diagnosis.replace("「", "").replace("」", "").replace("\n", "").replace(" ", "").replace("(", "（").replace(")", "）")
+    diagnosis = re.sub("（[^）]*）", "", diagnosis)
+    ft_output = "，".join([term2bterm.get(t.strip(), t.strip()) for t in diagnosis.split("，")])
+    ft_input = ft_text_template.format(d['性别'], d['年龄'], d['入院时主要症状及体征'], d['特殊检查及重要会诊'])
+    ft_input = ft_input.replace("「", "").replace("」", "")
+    for o in ft_output.split("，"):
+        ft_input = ft_input.replace(o, "")
+    ft_text_dict_input = ft_template.format(label_data_str, ft_input)
+    
+    pt_input = random.choice(pt_templates)
+    pt_output = ft_output
+    
+    num_dict_token = len(bert_tok(label_data_str, add_special_tokens=False)['input_ids'])
+    num_ft_text_dict_token = len(llm_tok(ft_text_dict_input, add_special_tokens=False)['input_ids'])
+    num_pt_token = len(llm_tok(pt_input+pt_output)['input_ids'])
+    num_ft_token = len(llm_tok(ft_input+ft_output)['input_ids'])
+    
+    d['pt_input'] = pt_input
+    d['pt_output'] = pt_output
+    d['label_data'] = label_data
+    d['raw_data'] = raw_data
+    d['label_data_str'] = label_data_str
+    d['ft_input'] = ft_input
+    d['ft_text_dict_input'] = ft_text_dict_input
+    d['ft_output'] = ft_output
+    d['num_dict_token'] = num_dict_token
+    d['num_ft_text_dict_token'] = num_ft_text_dict_token
+    d['num_pt_token'] = num_pt_token
+    d['num_ft_token'] = num_ft_token
+    
+    return d
 
-data_df = data_df[(df['门诊诊断'].apply(len)>0)&(df['出院诊断'].apply(len)>0)&(df['门诊出院bert_score_f1']<bert_score_f1_threshold)]
-print(f"filterd by 门诊 and 出院 and bert_score > {bert_score_f1_threshold}: {data_df.shape[0]} left")
+print(f"generating data_df")
+preprocessed_data = []
 
-# wash
-def wash(r):
-    new_output = r['output'].replace("「","").replace("」","").replace("\n","").replace(" ","").replace("(","（").replace(")","）")
-    new_output = re.sub("（[^）]*）","",new_output)
-    new_input = r['input'].replace("「","").replace("」","")
-    for o in new_output.split("，"):
-        new_input = new_input.replace(o,"")
-    return pd.Series(dict(input=new_input, data=r['data'], output=new_output))
+process_num = 8
+pool = multiprocessing.Pool(process_num)
+print(f"using {process_num} process")
+for output in tqdm(pool.imap(preprocess_data, data), total=len(data)):  
+	preprocessed_data.append(output)
+pool.close()
 
-data_df = data_df.progress_apply(wash, axis=1)
+# for d in tqdm(data):
+#     preprocessed_data.append(preprocess_data(d))
 
-data_df['num_tokens'] = data_df.progress_apply(lambda r : len(llm_tok(r['input']+r['output'])['input_ids']),axis=1)
-data_df = data_df[data_df['num_tokens'] < max_length1]
-print(f"filterd by max_length1: {data_df.shape[0]} left")
+data_df = pd.DataFrame(preprocessed_data)
 
-data_df_text_dicts = data_df.progress_apply(lambda r: pd.Series(
-    dict(
-        input='完整化验结果:'+', '.join([f"{k}:{v}" for dict in r['data'] for (k,v) in dict['data'].items()]) + "\n" + r['input'],
-        output=r['output']
-    )
-), axis=1)
-data_df_text_dicts['num_tokens'] = data_df_text_dicts.progress_apply(lambda r : len(llm_tok(r['input']+r['output'])['input_ids']),axis=1)
-data_df = data_df[data_df_text_dicts['num_tokens'] < max_length2]
-data_df_text_dicts = data_df_text_dicts[data_df_text_dicts['num_tokens'] < max_length2]
-print(f'filterd by max_length2: {data_df.shape[0]} left')
+# filter and organize data_df
+ft_index = (data_df['门诊诊断'].apply(len) > 0) \
+    & (data_df['出院诊断'].apply(len) > 0) \
+    & (data_df['门诊出院bert_score_f1'] < bert_score_f1_threshold) \
+    & (data_df['num_ft_token'] < max_ft_token_num) \
+    & (data_df['num_dict_token'] < max_dict_token_num) \
+    & (data_df['num_ft_text_dict_token'] < max_ft_text_token_num)
+print('ft_index: ', ft_index.sum())
 
-data_df_no_dicts = data_df.drop(columns=['data'])
+pt_index = (data_df['num_dict_token'] < max_dict_token_num) \
+    & (data_df['num_pt_token'] < max_pt_token_num)
+print('pt_index: ', pt_index.sum()) 
 
-data_df_raw = data_df.progress_apply(lambda r: pd.Series(
-    dict(
-        input=table_token+r['input'],
-        data=[[dict(header=d['header'],data=d['raw_data']) for d in r['data']]], 
-        output=r['output'],
-    )
-) ,axis=1)
+ft_index = topk_index(ft_index, max_ft_data_size)
+intersection = ft_index & pt_index
+print('intersection: ', intersection.sum())
+pt_index = pt_index & (~intersection)
+pt_index = topk_index(pt_index, max_pt_data_size)
 
-data_df_label = data_df.progress_apply(lambda r: pd.Series(
-    dict(
-        input=table_token+r['input'],
-        data=[[dict(header=d['header'],data=d['data']) for d in r['data']]], 
-        output=r['output'],
-    )
-) ,axis=1)
+pt_df = data_df[pt_index]
+ft_df = data_df[ft_index]
 
-data_df_pretrain = data_df_pretrain.iloc[:max_pretrain_data_size]
-pretrain_size = int(len(data_df_pretrain)*(1-prtrain_eval_ratio))
-train_df_pretrain = data_df_pretrain.iloc[:pretrain_size]
-eval_df_pretrain = data_df_pretrain.iloc[pretrain_size:]
+pt_normal_df = pt_df.progress_apply(lambda r: pd.Series(dict(input=r['pt_input'],data=r['label_data'],output=r['pt_output'])), axis=1)
+ft_no_dict_df = ft_df.progress_apply(lambda r: pd.Series(dict(input=r['ft_input'], output=r['ft_output'])), axis=1)
+ft_text_dict_df = ft_df.progress_apply(lambda r: pd.Series(dict(input=r['ft_text_dict_input'], output=r['ft_output'])), axis=1)
+ft_normal_df = ft_df.progress_apply(lambda r: pd.Series(dict(input=table_token+r['ft_input'], data=r['label_data'], output=r['ft_output'])), axis=1)
+ft_raw_data_df = ft_df.progress_apply(lambda r: pd.Series(dict(input=table_token+r['ft_input'], data=r['raw_data'], output=r['ft_output'])), axis=1)
 
-data_df = data_df.iloc[:max_ft_data_size]
-ft_size = int(len(data_df)*(1-ft_eval_ratio))
-train_df = data_df_label.iloc[:ft_size]
-eval_df = data_df_label.iloc[ft_size:]
-train_df_text_dicts = data_df_text_dicts.iloc[:ft_size]
-eval_df_text_dicts = data_df_text_dicts.iloc[ft_size:]
-train_df_no_dicts = data_df_no_dicts.iloc[:ft_size]
-eval_df_no_dicts = data_df_no_dicts.iloc[ft_size:]
-train_df_raw = data_df_raw.iloc[:ft_size]
-eval_df_raw = data_df_raw.iloc[ft_size:]
+pt_size = int(len(pt_df)*(1-pt_eval_ratio))
+train_df_pretrain = pt_normal_df.iloc[:pt_size]
+eval_df_pretrain = pt_normal_df.iloc[pt_size:]
 
-print(data_df['num_tokens'].describe())
-data_df['num_tokens'].hist(backend='plotly', title='text input token num').show()
-print(data_df_text_dicts['num_tokens'].describe())
-data_df_text_dicts['num_tokens'].hist(backend='plotly', title='text dict token num').show()
-data_df_pretrain['num_tokens'].hist(backend='plotly', title='pretrain output token num').show()
+ft_size = int(len(ft_df)*(1-ft_eval_ratio))
+train_df = ft_normal_df.iloc[:ft_size]
+eval_df = ft_normal_df.iloc[ft_size:]
+train_df_text_dicts = ft_text_dict_df.iloc[:ft_size]
+eval_df_text_dicts = ft_text_dict_df.iloc[ft_size:]
+train_df_no_dicts = ft_no_dict_df.iloc[:ft_size]
+eval_df_no_dicts = ft_no_dict_df.iloc[ft_size:]
+train_df_raw = ft_raw_data_df.iloc[:ft_size]
+eval_df_raw = ft_raw_data_df.iloc[ft_size:]
 
-json.dump(train_df.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train.json"),'w'), ensure_ascii=False)
-json.dump(eval_df.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval.json"),'w'), ensure_ascii=False, indent=4)
-json.dump(train_df_no_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_no_dicts.json"),'w'), ensure_ascii=False)
-json.dump(eval_df_no_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_no_dicts.json"),'w'), ensure_ascii=False, indent=4)
-json.dump(train_df_text_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_text_dicts.json"),'w'), ensure_ascii=False)
-json.dump(eval_df_text_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_text_dicts.json"),'w'), ensure_ascii=False, indent=4)
-json.dump(train_df_raw.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_raw_data.json"),'w'), ensure_ascii=False)
-json.dump(eval_df_raw.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_raw_data.json"),'w'), ensure_ascii=False, indent=4)
-json.dump(train_df_pretrain.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_pretrain.json"),'w'), ensure_ascii=False)
-json.dump(eval_df_pretrain.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_pretrain.json"),'w'), ensure_ascii=False, indent=4)
+data_df['num_dict_token'].hist(backend='plotly', title='num_dict_token').show()
+pt_df['num_pt_token'].hist(backend='plotly', title='num_pt_token').show()
+ft_df['num_ft_token'].hist(backend='plotly', title='num_ft_token').show()
+ft_df['num_ft_text_dict_token'].hist(backend='plotly', title='num_ft_text_dict_token').show()
+print(f"original diagnosis terms num: {len(term2bterm.keys())}")
+print(f"normalized diagnosis terms num: {len(set(list(term2bterm.values())))}")
+print(term2bterm)
+bterm2terms = {}
+for t, bt in term2bterm.items():
+    if bt not in bterm2terms:
+        bterm2terms[bt] = []
+    bterm2terms[bt].append(t)
+
+if not os.path.exists(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/")):
+    os.mkdir(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/"))
+json.dump(train_df.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train.json"), 'w'), ensure_ascii=False)
+json.dump(eval_df.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval.json"), 'w'), ensure_ascii=False, indent=4)
+json.dump(train_df_no_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_no_dicts.json"), 'w'), ensure_ascii=False)
+json.dump(eval_df_no_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_no_dicts.json"), 'w'), ensure_ascii=False, indent=4)
+json.dump(train_df_text_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_text_dicts.json"), 'w'), ensure_ascii=False)
+json.dump(eval_df_text_dicts.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_text_dicts.json"), 'w'), ensure_ascii=False, indent=4)
+json.dump(train_df_raw.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_raw_data.json"), 'w'), ensure_ascii=False)
+json.dump(eval_df_raw.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_raw_data.json"), 'w'), ensure_ascii=False, indent=4)
+json.dump(train_df_pretrain.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_train_pretrain.json"), 'w'), ensure_ascii=False)
+json.dump(eval_df_pretrain.to_dict(orient="records"), open(os.path.join(os.environ['my_datasets_dir'], f"ninth/v{version}/checkout_data_eval_pretrain.json"), 'w'), ensure_ascii=False, indent=4)

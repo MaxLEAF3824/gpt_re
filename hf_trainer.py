@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, asdict
 import json
 import pathlib
 from typing import Dict, Optional, Sequence, Tuple, Union, List, Any
+import psutil
 import torch.nn.functional as F
 import torch
 from transformers import Trainer, TrainingArguments, HfArgumentParser, AutoTokenizer, AutoModelForCausalLM, BertModel, BertTokenizer
@@ -59,16 +60,18 @@ def load_hf_model_tok(mt_path):
 @dataclass
 class ModelArguments:
     mt_path: str = field(default=None)
-    encoder_hidden_size : int = field(default=768)
-    num_table_token : int = field(default=5)
-    num_encoder_head : int = field(default=8)
-    num_encoder_layers : int = field(default=12)
+    encoder_hidden_size : int = field(default=2)
+    num_table_token : int = field(default=1)
+    num_encoder_head : int = field(default=2)
+    num_encoder_layers : int = field(default=1)
     special_tokens_path : str = field(default=None)
     mask_strategy : str = field(default="hierarchical")
     position_strategy : str = field(default="group")
     encoder_type : str = field(default="transformer")
     mapper_type : str = field(default="linear")
     deep_fusion : bool = field(default=False)
+    max_length : int = field(default=2048)
+
 @dataclass
 class DataArguments:
     train_data_path : str = field(default=None)
@@ -123,7 +126,7 @@ class DictLLMTrainer(Trainer):
                 loss, outputs = self.compute_loss(dllm, inputs, return_outputs=True, output_attentions=True)
                 loss = loss.mean().detach()
                 if self.args.compute_metrics:
-                    output_ids = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1], synced_gpus=True).to(dllm.llm.model.device)
+                    output_ids = dllm.generate(**inputs, cut_input=True, max_new_tokens=2*labels.shape[-1], synced_gpus=False).to(dllm.llm.model.device)
         return (loss, output_ids, labels)
 
 
@@ -149,6 +152,7 @@ def train():
     
     if local_rank == 0:
         gpustat.print_gpustat()
+        print(f"Available Memory: {psutil.virtual_memory().available/1024/1024/1024:.2f}GB")
 
     if debug_mode:
         training_args.report_to = []
@@ -156,10 +160,11 @@ def train():
         training_args.log_level = 'debug'
         training_args.log_level_replica = 'debug'
         training_args.num_train_epochs = 2
-        training_args.eval_steps = 32
+        training_args.eval_steps = 16
+        training_args.gradient_accumulation_steps = 1
         training_args.save_strategy = 'no'
-        max_train_size = 32 * training_args.per_device_train_batch_size * training_args.world_size // 2
-        max_eval_size = 16 * training_args.per_device_eval_batch_size * training_args.world_size
+        max_train_size = 16 * training_args.per_device_train_batch_size * training_args.world_size // 2
+        max_eval_size = 4 * training_args.per_device_eval_batch_size * training_args.world_size
         train_dst = train_dst[:max_train_size]
         eval_dst = eval_dst[:max_eval_size]
         rank0_print(
@@ -169,10 +174,6 @@ def train():
             f"max_eval_size = {max_eval_size}",
             f"eval_steps = {training_args.eval_steps}",
         )
-        # dllm.dict_encoder.register_forward_hook(lambda module, args, output: print(f"dict_encoder output: {output}"))
-        # dllm.llm.register_forward_hook(lambda module, args, output: print(f"dllm output: {output}"))
-        # dllm.dict_encoder.transformer_encoder.layers[0].self_attn.register_forward_pre_hook(hook=lambda module, args, kwargs: (args, kwargs.update(dict(need_weights=True)) or kwargs), with_kwargs=True)
-        # dllm.dict_encoder.transformer_encoder.layers[0].self_attn.register_forward_hook(hook=lambda module, args, output: print(f"dict_encoder_l0_self_attn output: {output}"))
     
     rank0_print(f"model_args: {model_args}\ndata_args: {data_args}\ntraining_args: {training_args}\ntrain_dst size: {len(train_dst)}")
     
@@ -216,8 +217,7 @@ def train():
         avg_rougel_p = sum([s['rouge-l']['p'] for s in batch_rouge_scores])/len(batch_rouge_scores)
         avg_rougel_r = sum([s['rouge-l']['r'] for s in batch_rouge_scores])/len(batch_rouge_scores)
         avg_rougel_f1 = sum([s['rouge-l']['f'] for s in batch_rouge_scores])/len(batch_rouge_scores)
-        std_rougel_f1 = np.std([s['rouge-l']['f'] for s in batch_rouge_scores])
-        report_metrics.update({'rougeL-p' : avg_rougel_p, 'rougeL-r':avg_rougel_r, 'rougeL' : avg_rougel_f1, 'rougeL-f1-std' : std_rougel_f1})
+        report_metrics.update({'rougeL-p' : avg_rougel_p, 'rougeL-r':avg_rougel_r, 'rougeL' : avg_rougel_f1})
         rank0_print("calculating rouge scores time: ", datetime.now()-start_time)
         
         # bert_scores
@@ -225,45 +225,17 @@ def train():
         start_time = datetime.now()
         predictions = original_predictions
         references = original_references
-        batch_bert_scores = bert_score.score(predictions, references, lang='zh') # p,r,f
-        batch_bert_scores = [s.cpu().tolist() for s in batch_bert_scores]
-        avg_bert_score_p = sum(batch_bert_scores[0]) / len(batch_bert_scores[0])
-        avg_bert_score_r = sum(batch_bert_scores[1]) / len(batch_bert_scores[1])
-        avg_bert_score_f1 = sum(batch_bert_scores[2]) / len(batch_bert_scores[2])
-        std_bert_score_f1 = np.std(batch_bert_scores[2])
-        report_metrics.update({'bert_score-p':avg_bert_score_p, 'bert_score-r':avg_bert_score_r, 'bert_score-f1':avg_bert_score_f1, 'bert_score-f1-std':std_bert_score_f1})
+        try:
+            batch_bert_scores = bert_score.score(predictions, references, lang='zh') # p,r,f
+            batch_bert_scores = [s.cpu().tolist() for s in batch_bert_scores]
+            avg_bert_score_p = sum(batch_bert_scores[0]) / len(batch_bert_scores[0])
+            avg_bert_score_r = sum(batch_bert_scores[1]) / len(batch_bert_scores[1])
+            avg_bert_score_f1 = sum(batch_bert_scores[2]) / len(batch_bert_scores[2])
+            report_metrics.update({'bert_score-p':avg_bert_score_p, 'bert_score-r':avg_bert_score_r, 'bert_score-f1':avg_bert_score_f1})
+        except:
+            pass
+
         rank0_print("calculating bert_scores time: ", datetime.now()-start_time)
-        
-        # set scores
-        # rank0_print("calculating set scores")
-        # start_time = datetime.now()
-        # predictions = original_predictions
-        # references = original_references
-        # batch_set_scores_p = []
-        # batch_set_scores_r = []
-        # batch_set_scores_f1 = []
-        # for pred, ref in zip(predictions, references):
-        #     p_list = pred.split("，")
-        #     r_list = ref.split("，")
-        #     ps = [[p]*len(r_list) for p in p_list]
-        #     ps = [p for pp in ps for p in pp]
-        #     rs = r_list * len(p_list)
-        #     set_scores = torch.cat(bert_score.score(ps, rs, lang='zh')).reshape(3, len(r_list), len(p_list))
-        #     set_scores_p = set_scores[2].max(dim=1).values.mean().item()
-        #     set_scores_r = set_scores[2].max(dim=0).values.mean().item()
-        #     if set_scores_p+set_scores_r == 0:
-        #         set_scores_f1 = 0
-        #     else:
-        #         set_scores_f1 = 2*set_scores_p*set_scores_r/(set_scores_p+set_scores_r)
-        #     batch_set_scores_p.append(set_scores_p)
-        #     batch_set_scores_r.append(set_scores_r)
-        #     batch_set_scores_f1.append(set_scores_f1)
-        # avg_set_score_p = sum(batch_set_scores_p) / len(batch_set_scores_p)
-        # avg_set_score_r = sum(batch_set_scores_r) / len(batch_set_scores_r)
-        # avg_set_score_f1 = sum(batch_set_scores_f1) / len(batch_set_scores_f1)
-        # std_set_score_f1 = np.std(batch_set_scores_f1)
-        # report_metrics.update({'set_score-p':avg_set_score_p, 'set_score-r':avg_set_score_r, 'set_score-f1':avg_set_score_f1, 'set_score-f1-std':std_set_score_f1,})
-        # rank0_print("calculating set scores time: ", datetime.now()-start_time)
         
         # bios socres
         rank0_print("calculate bios scores")
@@ -335,9 +307,8 @@ def train():
                 if max(intersect) == 0:
                     continue
                 else:
-                    precision += 1
+                    precision += 1 / len(pred_topk_cids)
                     ref_topk_cids.pop(np.argmax(intersect))
-            precision /= len(pred_terms)
             
             # recall
             recall = 0
@@ -351,10 +322,10 @@ def train():
                 if max(intersect) == 0:
                     continue
                 else:
-                    recall += 1
+                    recall += 1 / len(ref_topk_cids)
                     pred_topk_cids.pop(np.argmax(intersect))
-            recall /= len(ref_topk_cids)
-            f1_score = 2*precision*recall/(precision+recall) if precision+recall > 0 else 0
+
+            f1_score = 2*precision*recall/(precision+recall) if precision + recall > 0 else 0
             return precision, recall, f1_score
 
         for pred, ref in zip(predictions, references):
@@ -366,8 +337,7 @@ def train():
         avg_bios_score_p = sum(batch_bios_scores_p) / len(batch_bios_scores_p)
         avg_bios_score_r = sum(batch_bios_scores_r) / len(batch_bios_scores_r)
         avg_bios_score_f1 = sum(batch_bios_scores_f1) / len(batch_bios_scores_f1)
-        std_bios_score_f1 = np.std(batch_bios_scores_f1)
-        report_metrics.update({'bios_score-p':avg_bios_score_p, 'bios_score-r':avg_bios_score_r, 'bios_score-f1':avg_bios_score_f1, 'bios_score-f1-std':std_bios_score_f1})
+        report_metrics.update({'bios_score-p':avg_bios_score_p, 'bios_score-r':avg_bios_score_r, 'bios_score-f1':avg_bios_score_f1})
         rank0_print("calculating bios scores time: ", datetime.now()-start_time)
         
         for pred,ref,rouge_score, bertscore, bios_score in zip(predictions, references, batch_rouge_scores, batch_bert_scores[2], batch_bios_scores_f1):
@@ -394,9 +364,6 @@ def train():
                     'bert_scores_p':batch_bert_scores[0],
                     'bert_scores_r':batch_bert_scores[1],
                     'bert_scores_f':batch_bert_scores[2],
-                    # 'set_scores_p':batch_set_scores_p,
-                    # 'set_scores_r':batch_set_scores_r,
-                    # 'set_scores_f':batch_set_scores_f1,
                     'bios_scores_p':batch_bios_scores_p,
                     'bios_scores_r':batch_bios_scores_r,
                     'bios_scores_f':batch_bios_scores_f1
@@ -417,7 +384,7 @@ def train():
     else:
         trainer.train()
     
-    if training_args.save_strategy != 'no':
+    if not debug_mode:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_dllm
 #SBATCH --partition=medai
-#SBATCH --nodes=1
+#SBATCH --nodelist=SH-IDC1-10-140-1-154
 #SBATCH --quotatype=auto
 #SBATCH --output=slurm_log/%x-%j.out
 #SBATCH --error=slurm_log/%x-%j.out
